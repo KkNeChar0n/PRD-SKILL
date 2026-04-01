@@ -240,10 +240,10 @@ Use this as a starting structure:
     <li style="font-weight: bold; font-size: 18px; padding: 8px 12px; background: #e3f2fd; border-radius: 4px; margin-bottom: 8px;">
       产品名称
       <ul style="list-style: none; padding-left: 24px; margin-top: 8px;">
-        <li style="border-left: 2px solid #90caf9; padding: 6px 12px; margin-bottom: 4px;">
+        <li style="border-left: 2px solid #90caf9; padding: 6px 12px; margin-bottom: 8px; font-weight: bold; font-size: 16px;">
           服务范围
-          <ul style="list-style: none; padding-left: 24px; margin-top: 6px;">
-            <li style="border-left: 2px solid #c8e6c9; padding: 4px 12px; margin-bottom: 2px;">功能名称 — 功能描述</li>
+          <ul style="list-style: none; padding-left: 24px; margin-top: 6px; font-weight: normal; font-size: 14px;">
+            <li style="border-left: 2px solid #c8e6c9; padding: 4px 12px; margin-bottom: 4px;">功能名称 — 功能描述</li>
           </ul>
         </li>
       </ul>
