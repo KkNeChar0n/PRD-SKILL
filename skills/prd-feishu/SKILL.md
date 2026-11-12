@@ -1,19 +1,37 @@
 ---
 name: prd-feishu
-description: Generate a PRD and publish it to a Feishu (Lark) docx document, then sync the URL back to the corresponding aliyuncs requirement description. Primary mode: take a requirement identifier (id or subject) from .aliyuncs.json and auto-resolve the pre-created Feishu node URL. Fallback: take a Feishu URL directly.
-argument-hint: "<requirement-identifier-or-feishu-url> [extra context]"
+description: "先制作并审查可操作的单文件 HTML 原型，再写 PRD；从原型截取对应页面状态放入各节原型图位置，将共用 HTML 放在迭代版本文档并让需求文档引用，同步云效需求至设计中。适用于首次生成或完整重写；局部修改用 prd-feishu-edit。"
 allowed-tools: Read, Write, Bash, Glob, Grep, AskUserQuestion, Agent
 ---
 
 # 飞书 PRD 生成器
 
-You are a senior product manager. 写一份产品视角的 PRD，发布到飞书云文档，同时把飞书 URL 回写到对应云效需求的描述顶部。
+You are a senior product manager. 先还原用户要求的页面和完整交互，再依据审查通过的原型写产品视角 PRD、发布飞书，并把飞书 URL 回写到对应云效需求的描述顶部。
 
 > ⚠️ **只在「首次生成 / 完整重写」时用本 skill。** 本 skill 的 `publish.py` 会
 > **清空整篇文档再从本地 HTML 重写**，会抹掉用户在飞书里手动改过的内容。
 > 如果用户是要**修改一份已发布的 PRD**（改文案 / 加一行 / 调某节原型图 / 改规则），
 > **改用 `/prd-feishu-edit`** —— 它以飞书实时文档为准，只改用户点名的章节，
 > 且先出「原内容 vs 修改后」评审子节点、批准后才合并。**不要为了「改一下」重跑本 skill。**
+
+## 原型先行：强制审查关口
+
+首次生成或完整重写 PRD 时，依次完成以下阶段。此关口同时适用于需求标识模式和直传 URL 模式；用户明确要求跳过原型时，以用户当次指示为准。
+
+1. **收集页面依据。** 读取用户给的截图、录屏、文字、现有页面或其他参考，明确要做的页面、入口、可见字段、交互和业务结果。截图只证明可见状态；未展示的交互先结合用户说明、现有系统和同一需求上下文核实。仍影响方案的缺口，集中问用户，不把猜测写成确定需求。
+2. **制作一个可操作的 HTML 原型。** 在项目工作区持久保存 `outputs/prd-prototypes/<需求标识或名称>/<时间戳>/prototype.html`，使用单文件 HTML（CSS、JS 内联；确需外部素材时一并固定版本）。同一迭代已有共用原型时，以其当前版本为基线，在候选副本中加入本需求交互，保留其他需求的页面与状态。按用户提供的页面风格还原，覆盖本需求范围内的完整用户路径：入口、切换、筛选或选择、表单、校验、确认或取消、结果反馈，以及相关的空态、错误态和不可操作态。按钮和链接应有对应模拟行为；只用模拟数据，不调用生产写接口。原型须能脱离 PRD 单独打开和体验。
+3. **模拟用户逐步检查。** 用浏览器真实点击主要路径，检查状态是否连贯、弹窗能关闭、校验与反馈是否可见；记录简短的操作路径，给用户本地 HTML 链接审查。用户提出修改时只迭代该原型。**用户明确表示原型通过前，不写 PRD 正文，不调用 `publish.py`，不清空飞书文档，也不更新云效状态。**
+4. **原型通过后写 PRD 并配图。** 以最终 HTML 中已确认的页面、状态、动作和结果为依据补齐业务规则。在每个相关功能的“原型图”小节，从同一 HTML 操作到对应状态并截取页面或弹窗，放在该小节字段表或说明附近；一图可覆盖多个相邻字段，不必机械地每个字段一图。入口、关键分支和结果态应有足够截图让读者对照交互；不相关的截图不插入。截图必须来自已审查的 HTML，不能重新画另一套 UI。若要新增超出原型的逻辑，先更新原型并复核。
+5. **发布并读回。** 将已审查 HTML 上传或替换到需求 wiki 节点的**直接父级迭代版本文档**中的唯一文件块，需求 PRD 的“可交互原型”只放版本文档链接；截图仍按 PRD 位置插入图片块。运行 `publish.py --prototype-attachment`，读回 PRD 链接、截图与父级文件块后才同步云效状态。下载的 HTML 可在本地浏览器操作；飞书文档中的文件块不运行脚本。
+
+### 版本共用原型的边界
+
+- 每个迭代版本文档维护一个 `共用交互原型.html` 文件块。后续需求修改时更新**同一文件块**，需求文档不再各自上传 HTML 副本；不同迭代各有自己的文件。
+- 需求文档必须是 wiki 节点，且直接父节点为 docx 类型的迭代版本文档。父子关系不明或父节点不支持附件时，停止发布并核对节点，不静默改放到需求文档。
+- 发布前确认候选原型包含本迭代已批准的其他交互，固定其 SHA-256。需求文档中的原型截图是该需求审查时的页面状态，**不会随共用 HTML 更新**；需要更新截图时按 `prd-feishu-edit` 另行评审对应章节。
+- `--prototype-attachment` 参数继续接受已批准 HTML 路径，但目的地改为迭代版本文档。发布器验证父子关系、更新父级文件块，并在当前需求 PRD 写入版本文档链接。已上传的旧需求附件须单独迁移或移除，避免读者下载到旧版。
+
+截图位置、文件标记和验收要点见 [交互原型工作流](references/interactive-prototype.md)。
 
 ## Input
 
@@ -26,6 +44,7 @@ You are a senior product manager. 写一份产品视角的 PRD，发布到飞书
    - `subject` 完全相等
    - `subject` 包含该字符串（仅当唯一命中时）
    - 多义或无命中 → AskUserQuestion 让用户从列表选
+3. 如果没有参数，先根据当前对话中的唯一需求、用户给的页面截图或云效工作项定位；仍不唯一时再请用户选择。截图和交互说明可以分批提供，定位后开始原型阶段。
 
 ## 主工作流（需求标识模式 = 推荐）
 
@@ -37,21 +56,35 @@ skill 步骤：
 2. 模糊匹配「应用管理详情页」→ 找到 requirement → 取 feishu_url
 3. 如 feishu_url 为空：提示用户先确保 aliyuncs:create-requirement 已绑定飞书节点
    （旧需求可能没绑，告知用户在飞书手动建一个节点并回填 feishu_url，或重跑 create-requirement）
-4. 按 prd skill 的内容结构生成 PRD HTML 到 /tmp/prd-feishu-{ts}.html
-5. 调用 python3 ~/.claude/skills/prd-feishu/publish.py <临时HTML> <feishu_url>
-6. publish.py 自动：
+4. 根据截图/说明制作持久保存的 `prototype.html`，逐步点测，交用户审查；依据反馈修改到用户明确通过
+5. 从通过的原型提取页面与交互规则，按 prd skill 的内容结构生成独立的 PRD HTML
+6. 将原型中的对应页面状态截图，插在 PRD 每节“原型图”位置，核对截图与文案一致
+7. 调用 `python3 <本 skill 目录>/publish.py <PRD_HTML> <feishu_url> --prototype-attachment <已批准的本迭代共用原型.html>`
+8. publish.py 自动：
    - 写飞书内容（清空 + 插入）
-   - 上传原型图 + 绑定
+   - 按 PRD 位置上传原型截图 + 绑定
+   - 在直接父级版本文档中上传或替换唯一的可操作 HTML 文件块，并读回校验
+   - 在需求 PRD 中写入指向该版本文档的“可交互原型”链接，不创建需求级 HTML 附件
    - 父节点 / 祖父节点向上回链
    - 反查 .aliyuncs.json 拿到 requirement.identifier，把飞书 URL 同步到云效需求描述顶部
+   - 飞书正文、截图、版本共用附件与需求链接均成功后，把对应云效需求状态更新为「设计中」，并同步写回 `.aliyuncs.json`
+9. 读回飞书需求文档和版本文档，核对各截图所在章节、链接、共用附件名称及原型版本，向用户交付 PRD 链接
 ```
 
 ## 备用工作流（直传 URL 模式 = 飞书优先，云效可选）
 
 如果用户直接给了飞书 URL（适用于「这份 PRD 不挂在云效」的临时场景）：
-1. 同样按 prd 规则生成 HTML
-2. 调 publish.py <HTML> <用户给的 URL>
+1. 同样执行“原型先行”审查关口，再从通过的原型写 PRD HTML
+2. 在对应章节插入已审查原型截图，调用带 `--prototype-attachment` 的 publish.py
 3. publish.py 仍会尝试反查 `.aliyuncs.json` 的 feishu_url 同步描述；找不到匹配项就跳过云效同步
+
+## 云效状态联动
+
+- 只有飞书 PRD、各节原型截图、需求文档中的版本链接与版本文档中的共用 HTML 均已成功写入后才更新状态；原型审查、本地 PRD 草稿等中间步骤不触发。
+- 按飞书 URL 中的 wiki/docx token 匹配 `.aliyuncs.json` 的需求，忽略 host、query 与尾斜杠差异。
+- 目标状态固定为「设计中」，但 identifier 必须从该需求的实际工作流按名称动态解析，不得写死项目状态 ID。
+- 远端已是「设计中」时视为幂等成功，仍校准 `.aliyuncs.json` 中的 `status`。
+- 直传 URL 且没有匹配需求时可以跳过；已经匹配到需求但状态更新失败时，必须明确报告“飞书已发布、云效状态未更新”并以非零状态退出，不得伪报全流程成功。
 
 ## 飞书节点的来源
 
@@ -77,7 +110,9 @@ fi
 
 读取 `app_id` / `app_secret` / `app_domain`（不再需要 `default_folder_token`）。
 
-### 2. 检查 Chrome 是否可用（用于渲染原型图 PNG）
+### 2. 检查截图工具
+
+截图时使用能操作已审查 HTML 的浏览器工具，保存 PNG 并人工核对。只有旧式 SVG / 视觉容器仍需发布器调用本机 Chrome 渲染时，才检查 Chrome 路径：
 
 ```bash
 CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
@@ -90,7 +125,7 @@ fi
 
 ## PRD 内容结构（与 `prd` skill 完全一致）
 
-**PRD 结构和写作规则等同于 `prd` skill 的 SKILL.md**（详见 `~/.claude/skills/prd/SKILL.md`），主要章节：
+**PRD 结构和写作规则等同于同级 `prd` skill 的 SKILL.md**，主要章节：
 
 1. `# 需求名称`（H1 标题，等同于飞书文档标题）
 2. `## 需求目标`
@@ -99,13 +134,13 @@ fi
    - `### 3.2 功能清单`（Markdown 表格：编号 | 名称 | 类型 | 说明）
 4. `## 需求详述`
    - `### 4.x 功能名`
-     - `#### 4.x.1 状态机`（仅在功能有真实用户可感知的业务状态流转时画；状态机使用 SVG，**作为原型图渲染为 PNG**）
-     - `#### 4.x.2 原型图`（含筛选区 / 列表区 / 表单区表格 + 视觉原型设计图；**视觉原型设计图渲染为 PNG**）
+     - `#### 4.x.1 状态机`（仅在功能有真实用户可感知的业务状态流转时画；状态机使用 SVG，发布时转 PNG）
+     - `#### 4.x.2 原型图`（含对应 HTML 页面状态的截图及筛选区 / 列表区 / 表单区字段表；每个“原型图”小节至少有一张对应截图）
      - `#### 4.x.3 逻辑补充`（仅在有复杂业务逻辑时写）
 
 ### 项目级偏好规则（严守）
 
-参见 `~/.claude/projects/-Users-charon-TRSA/memory/feedback_prd_writing.md`：
+本项目沿用以下写作偏好：
 
 1. **不写「数据关系」章节** — 不列后端表名 / 字段映射 / 外键
 2. **产品视角，重用户体验** — 不写技术实现细节（缓存 TTL / 幂等键 / 性能 P95 等）
@@ -113,66 +148,43 @@ fi
 4. **状态机判断准则** — 没有真实业务状态流转就**整个省略状态机小节**（连小标题也不要保留）
 5. **规则类内容写「具体规则」** — 涉及评级 / 判定 / 计算 / 分级时要把每档 / 每条规则讲清楚
 
-## 视觉原型图处理（与 `prd` skill 的关键差异）
+## 可操作 HTML 与原型截图
 
-`prd` skill 把视觉原型图作为内联 HTML 块嵌入文档；本 skill **把每个视觉原型图渲染为 PNG，上传到飞书作为图片块**。
+已审查的 `prototype.html` 是页面和交互的依据。写 PRD 时先按功能章节列出需要看到的页面状态，再从该 HTML 实际操作到这些状态截图。优先截取包含完整上下文的页面区域；弹窗可单独截，但要保留足够的页面背景以识别入口。长页面分段截图，避免缩成看不清的一张图；相同状态不要重复插图。
 
-### 步骤
+将 PNG 保存在原型目录的 `screenshots/` 下，文件名说明页面和状态。每张图放在**对应的 `4.x 原型图` 小节**，靠近其字段表或交互说明；不要全部放在文档末尾，也不要只放状态机图。示例：
 
-对 PRD 中每个需要视觉原型图的位置（如「新增云资源弹窗」「证书列表」「告警通知样式」等）：
-
-1. **生成原型图 HTML 片段**（独立小文件）：
-   - 同 `prd` skill 的设计语言：浅灰背景容器 + 白色卡片 + 边框颜色编码 + 黄色 ★ 高亮新增字段
-   - 一个原型图一个 `.html` 文件，存到 `/tmp/prd-feishu-{timestamp}/proto-{seq}.html`
-   - 文件含完整 `<!DOCTYPE html><html><head>...</head><body>...</body></html>` 结构
-   - body 设固定 max-width（比如 880px），避免渲染时被压扁
-
-2. **用 Chrome headless 渲染为 PNG**：
-
-```bash
-"$CHROME" --headless --disable-gpu --no-sandbox \
-  --hide-scrollbars \
-  --window-size=920,1200 \
-  --default-background-color=ffffffff \
-  --screenshot="/tmp/prd-feishu-{ts}/proto-{seq}.png" \
-  "file:///tmp/prd-feishu-{ts}/proto-{seq}.html"
+```html
+<h4>4.2.2 原型图</h4>
+<h5>连接成功后的应用选择</h5>
+<figure data-prd-screenshot="outputs/prd-prototypes/需求ID/时间戳/screenshots/02-应用选择.png"
+        data-prototype-state="阿里云 ALB 连接成功，已扫描并勾选两个应用"
+        data-prototype-sha256="已审查 prototype.html 的 SHA-256">
+  <img src="outputs/prd-prototypes/需求ID/时间戳/screenshots/02-应用选择.png"
+       alt="连接成功后的应用选择" style="max-width:100%;height:auto;">
+  <figcaption>图：连接成功后选择应用</figcaption>
+</figure>
 ```
 
-- 窗口宽度比 body max-width 略大（如 max-width:880 → window-size:920），避免横向滚动条
-- 窗口高度直接给足（如 3000），避免内容被截断；底部空白靠后续裁剪去除
-- `--default-background-color=ffffffff` 让背景为白色（默认透明的话上传飞书会有色块）
-- **渲染完成后用 PIL 自动裁剪底部白边**（必须做，否则飞书文档里图片下方会有大块空白）：
+- `data-prd-screenshot` 是相对 PRD HTML 所在目录的 PNG 路径；`img src` 用同一路径，让本地 PRD 也能看到图。
+- `data-prototype-state` 记录截图时的页面和状态；`data-prototype-sha256` 必须等于发布时原型文件的哈希。发布器会检查这两项和图片文件，按正文顺序绑定到飞书图片块。
+- 截图前核对选中态、字段值、提示和弹窗与同节文字一致。截图应可辨认表头、输入项和按钮；裁掉大块空白，保留完整的相关表格和操作。
+- 不把现网截图、重新绘制的静态图或其他版本原型冒充已审查 HTML 的截图。交互原型发生变化时重新审查并重截受影响图片。
+- 状态机图只在确有业务状态流转时出现，可继续用 SVG 图，但不能代替页面原型截图。
 
-```python
-from PIL import Image, ImageChops
-img = Image.open(png_path).convert('RGB')
-bg = Image.new('RGB', img.size, (255, 255, 255))
-bbox = ImageChops.difference(img, bg).getbbox()
-if bbox:
-    _, _, _, bt = bbox
-    bt = min(img.size[1], bt + 20)  # 留 20px padding
-    img.crop((0, 0, img.size[0], bt)).save(png_path)
-```
-
-3. **彩色徽章纯文本化**：在生成 Markdown 主体时，把 HTML 原型图里的彩色徽章替换为纯文本标注。例如：
-   - HTML 渲染图里：绿色徽章 `● 已验证`
-   - Markdown 主体引用时：`● 已验证（绿）`
-   
-   这样原型图 PNG 里有视觉颜色，Markdown 主体里有文字说明，两者互补。
-
-### 状态机图
-
-状态机用 SVG 绘制（同 `prd` 的水平泳道格式：操作 / 状态 / 事件三泳道）。SVG 也用上面的"独立 HTML 文件 + Chrome 渲染"方式转 PNG。
+原型 HTML 默认作为迭代版本文档中的唯一附件交付；需求 PRD 只保留指向该版本文档的链接。用户从版本文档下载后可在浏览器操作；截图供直接阅读 PRD 时快速对照。截图采集与验收细节见 [交互原型工作流](references/interactive-prototype.md)。
 
 ## 实现脚本
 
-本 skill 目录下自带 `publish.py`，封装了完整的 API 调用、清空文档、转换、插入、上传、绑定 + **向上回链**流程。一般用法：
+本 skill 目录下自带 `publish.py`，封装了正文转换、按位置插图、父级版本文档中的共用 HTML 文件块、需求链接、读回校验和向上回链。发布前可用 `--prepare-only` 检查 Markdown 与图片顺序，不调用远端接口。PRD 默认用法：
 
 ```bash
-python3 "$HOME/.claude/skills/prd-feishu/publish.py" <PRD_HTML 路径> <飞书文档 URL>
+python3 "<本 skill 目录>/publish.py" \
+  <PRD_HTML 路径> <飞书文档 URL> \
+  --prototype-attachment <已审查的本迭代共用原型.html>
 ```
 
-只在脚本无法满足需求时再按下方步骤逐项调用 API。
+可加 `--prototype-parent-url <版本文档 wiki URL>` 显式核对父节点；它必须与需求 wiki 的直接父节点一致。用户明确选择 HTTPS 内嵌且已提供稳定地址时，才可沿用 `--prototype-html <HTML> --prototype-url <HTTPS_URL>`。不带原型参数的旧用法仅保留给 `gray-report`、`regression-report` 等非 PRD 调用方；本 skill 的首次 PRD 流程必须传入原型。只在脚本无法满足需求时再按下方步骤逐项调用 API。
 
 ## 向上回链（自动维护目录索引）
 
@@ -333,7 +345,11 @@ curl -s -X PATCH "https://$DOMAIN/open-apis/docx/v1/documents/$DOC_ID/blocks/$IM
 
 `$FILE_TOKEN` 是步骤 6 上传图片素材返回的 token；`$IMAGE_BLOCK_ID` 是步骤 5 descendant 接口返回的真实图片块 ID。**按顺序一一对应**：第 N 个原型图 PNG 上传得到的 file_token，绑定到第 N 个图片块的 block_id。
 
-## 步骤 8：输出飞书文档链接
+### 步骤 8：在版本文档更新共用 HTML 并读回
+
+发布器在清空需求 PRD 之前，先解析该需求 wiki 的直接父级版本文档。版本文档第一次交付时创建 `block_type=23` 的文件块；已有 `共用交互原型.html` 时复用其**内层 File block_id**。用该 ID 作为 `parent_node`、`parent_type=docx_file` 上传已审查 HTML，再对同一文件块执行 `replace_file`。读回文件块，确认 token 与文件名；随后在需求 PRD 的“可交互原型”小节写入版本文档链接。不得在需求文档再建 HTML 文件块。此步失败时不清空需求 PRD，也不更新云效状态。
+
+## 步骤 9：输出飞书文档链接
 
 ```
 ✓ 飞书 PRD 已写入：
@@ -343,25 +359,17 @@ curl -s -X PATCH "https://$DOMAIN/open-apis/docx/v1/documents/$DOC_ID/blocks/$IM
 ## 完整流程伪代码
 
 ```
-1. 验证 config + Chrome 可用，解析 ARGUMENTS = <URL> <需求描述>
-2. 生成 PRD 内容草稿（含原型图标记）
-3. 与用户确认大纲（功能清单层级、原型图数量）
-4. 换 tenant_access_token
-5. 解析 URL → 拿到 DOC_ID（wiki URL 要先 get_node 转）
-5b. 清空 DOC_ID 文档现有 blocks（GET /blocks 列出 + DELETE batch_delete 根块下所有 children）
-6. 渲染每个原型图为 PNG：
-   a. 写 HTML 片段到 /tmp/.../proto-N.html
-   b. Chrome headless 截图（高度给足，如 3000）
-   c. PIL ImageChops 自动裁剪底部白边
-7. 组装 Markdown（占位图标 ![](placeholder-N)）
-8. POST /docx/v1/documents/blocks/convert → 得 blocks / first_level_block_ids
-9. 清理 blocks（表格去 merge_info）
-10. POST /docx/v1/documents/{DOC_ID}/blocks/{DOC_ID}/descendant 插入 → 从响应里拿真实 IMAGE_BLOCK_ID_N
-11. 对每个原型图 PNG：
+1. 根据用户截图和交互说明做 prototype.html，模拟点击检查；用户审查，修改至明确通过
+2. 从批准的原型写 PRD HTML，在每个“原型图”小节放入对应页面状态的 PNG 与标记
+3. 用 --prepare-only 检查 Markdown、截图顺序与原型哈希，再调用 publish.py 正式发布
+4. publish.py 验证 config、截图文件和原型文件；换 tenant_access_token，解析 URL → DOC_ID
+5. 清空目标空节点并插入 PRD Markdown blocks
+6. 对每个静态原型图 PNG：
     a. POST /drive/v1/medias/upload_all 上传 (parent_node=IMAGE_BLOCK_ID_N, parent_type=docx_image) → 得 FILE_TOKEN_N
     b. PATCH /docx/v1/documents/{DOC_ID}/blocks/{IMAGE_BLOCK_ID_N} replace_image=FILE_TOKEN_N
-12. 清理临时文件 /tmp/prd-feishu-{ts}/*
-13. 输出 TARGET_URL 让用户复查
+7. 在直接父级版本文档中复用或创建唯一 HTML 文件块，上传并绑定附件，GET 核对文件 token；在需求 PRD 追加指向版本文档的“可交互原型”链接
+8. 回链飞书目录，更新云效描述和「设计中」状态
+9. 读回飞书需求正文、各节图片、版本链接和父级附件；核对章节与截图内容，交付 PRD 链接
 ```
 
 ## 错误处理
@@ -377,27 +385,19 @@ curl -s -X PATCH "https://$DOMAIN/open-apis/docx/v1/documents/$DOC_ID/blocks/$IM
 | 插入嵌套块失败 (1770029 block not support to create) | 用了 `/children` 接口，必须用 `/descendant` |
 | 图片上传失败 (1061044 parent node not exist) | 用了 convert 返回的 block_id；要用 descendant 接口插入后响应里的真实 image block_id |
 | 更新图片块失败 (1770001 invalid param) | parent_node 没填对（必须是真实 image_block_id，不是 DOC_ID）|
-
-## 性能与费用
-
-- **单份 PRD 大致 API 调用量**：
-  - 1 次：创建文档
-  - 1 次：Markdown 转换
-  - 1~3 次：创建嵌套块（按 1000 块/次，复杂 PRD 一般 1 次够）
-  - N 次：上传图片素材（N = 原型图数量，平均 8~15）
-  - N 次：update_block 替换图片
-  - **总计：约 20~35 次/份**
-- **频率限制**：每秒 3 次（应用级 + 文档级），需要在调用间加 350ms 间隔，避免 429
-- **免费版额度**：基础免费版 10,000 次/月（2026 年 5 月限时 100 万次/月），可写 300~500 份/月，绰绰有余
+| 原型截图路径或哈希不匹配 | 回到已审查 HTML，重截对应状态并更新 PRD 中的文件路径与哈希；发布前停止 |
+| “原型图”小节没有截图 | 从同一 HTML 补截对应状态；只有规则说明的小节应改名 |
+| 版本共用 HTML 上传或绑定失败 | 核对父级 docx 的内层 File block_id、`parent_type=docx_file` 与 `replace_file`；云效状态保持不变 |
+| 用户明确选择的 HTTPS iframe 不可用 | 保留已审查 HTML，修复托管与 iframe 限制后再发布 |
 
 ## 与 `prd` skill 的关系
 
 | 维度 | `prd` skill | `prd-feishu` skill |
 |------|------------|---------------------|
-| 输出 | 本地 `PRD_xxx.html` 含内联编辑器 | 飞书云文档链接 |
-| 原型图 | 内联 HTML 块（含工具栏可编辑） | 渲染为 PNG，作为飞书图片块 |
+| 输出 | 本地 `PRD_xxx.html` 含内联编辑器 | 先交付可操作 `prototype.html`；通过后交付飞书云文档 |
+| 原型图 | 内联 HTML 块（含工具栏可编辑） | 已审查 HTML 的页面状态截图，按功能节插入飞书图片块 |
 | 彩色徽章 | 内联 CSS 颜色 | 纯文本标注 + 原型图 PNG 内的颜色 |
-| 编辑方式 | 浏览器打开 HTML 点编辑 | 飞书协同编辑 |
+| 编辑方式 | 浏览器打开 HTML 点编辑 | 从版本文档下载共用原型后操作，PRD 在飞书协同编辑 |
 | 适用场景 | 单人写作 / 邮件发送 / 粘贴到语雀 | 团队协同 / 评审 / 长期演进 |
 
 两个 skill **共享 PRD 结构和内容规则**（章节大纲、字段说明表、状态机判定准则、规则要具体等），只在「输出形态」和「原型图呈现方式」上不同。修改 PRD 内容规则时两个 skill 都要同步。

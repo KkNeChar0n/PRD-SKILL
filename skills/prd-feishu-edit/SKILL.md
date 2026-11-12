@@ -1,7 +1,6 @@
 ---
 name: prd-feishu-edit
-description: Surgically modify an already-published Feishu PRD without clobbering the user's manual edits. Reads the LIVE Feishu doc as source of truth, only rewrites the section(s) the user names, and routes every change through a review child-node → approve → merge gate. The review node shows the change inline — additions in red, deletions struck through — so the user can see exactly what changed. Use when the user asks to CHANGE / FIX / ADJUST an existing published PRD (not to create a new one). Do NOT re-run prd-feishu/publish.py for edits — it clears + overwrites the whole doc and destroys manual changes.
-argument-hint: "<requirement-identifier-or-feishu-url> 改：<要改哪里、改成什么>"
+description: "局部修改已发布的飞书 PRD，保留用户手动编辑。涉及原型时先修改可操作 HTML 并由用户验收，再建立差异评审子节点，第二次批准后才合并；合并时更新迭代版本文档的唯一共用 HTML，并保留原版以便回滚。合并成功后同步云效为已完成。不用于首次生成或完整重写。"
 allowed-tools: Read, Write, Bash, Glob, Grep, AskUserQuestion
 ---
 
@@ -16,6 +15,11 @@ allowed-tools: Read, Write, Bash, Glob, Grep, AskUserQuestion
 3. **改了什么一眼可见。** 「修改后」那一版是**带差异标记**的：
    **新增的内容 = 红色字体**，**删除的内容 = 灰色划掉**，没改的行是普通黑字。
    用户不用逐字对比两大段，扫一眼颜色就知道你动了哪几处。
+4. **修改的是产品方案，不是文档本身。** 已发布 PRD 可能仍是尚未开发的拟议方案。用户说“去掉 / 改成 / 不要”时，
+   默认是在修订这套方案，而不是要求正文记录“这份文档发生了什么变化”。最终 PRD 必须继续站在**当前线上版本 → 最终目标版本**的视角描述需求；
+   “删除原章节”“本次替换原型图”“原方案改为”等文档编辑过程，只能出现在评审说明或差异样式里，不能落入正式正文。
+5. **涉及原型时有两个独立确认点。** 先交付修改后的可操作 HTML，用户明确验收通过后才建立「修改建议」文档；用户再批准评审文档后才合并原 PRD。原型未通过时可回到修改前的 HTML，飞书原文档保持原状。
+6. **同一迭代只有一份飞书 HTML。** 可操作原型放在需求 wiki 的直接父级迭代版本文档，需求 PRD 的“可交互原型”只链接该版本文档。局部合并成功后替换父级的 `共用交互原型.html` 文件块内容；不要在需求文档上传新副本。各需求 PRD 已插入的截图是当时审查状态，不会因共享 HTML 更新而自动变化。
 
 ## 什么时候用这个 skill（vs prd-feishu）
 
@@ -37,12 +41,12 @@ allowed-tools: Read, Write, Bash, Glob, Grep, AskUserQuestion
   多义或无命中就 AskUserQuestion 让用户选。
 - 其余文字是**修改描述**（改哪里、改成什么）。描述不清时先问清楚再动手。
 
-## 三步工作流（务必按顺序）
+## 工作流（务必按顺序）
 
 ### 第 1 步 · fetch —— 看清「当前真实内容」
 
 ```bash
-python3 "$HOME/.claude/skills/prd-feishu-edit/edit.py" fetch "<target_url>"
+python3 "<本 skill 目录>/edit.py" fetch "<target_url>"
 ```
 
 脚本会：
@@ -52,7 +56,19 @@ python3 "$HOME/.claude/skills/prd-feishu-edit/edit.py" fetch "<target_url>"
 **你必须先读这份实时内容**，据此判断要改的内容落在哪个标题小节里。
 锚点标题文本要用**索引里给出的当前真实文本**（用户可能已改过标题），不要用你记忆里的旧标题。
 
-### 第 2 步 · 生成 plan.json 并建评审子节点
+### 第 1.5 步 · 涉及原型时先改 HTML、验收、保留回滚点
+
+仅当用户的修改会改变页面布局、字段、弹窗、状态或交互时执行；纯文案 / 规则修改直接进入第 2 步。
+
+1. 找到该迭代实际使用的**完整共用 HTML**（优先本地共用原型，必要时核对直接父级版本文档中的附件），并确认它包含该需求及同迭代其他已批准交互。历史需求文档里的独立附件可能是旧副本，不得作为当前基线。若没有原始 HTML，就先用现有页面和实时文档建立基线；不要假称能精确恢复一个未找到的旧文件。
+2. 在 `outputs/prd-prototypes/<需求标识>/<时间戳>/` 复制原始文件为 `baseline.html`，记录 SHA-256 并将基线文件设为只读；再复制出可编辑的 `candidate.html`，**只改 candidate**。若原型是本迭代共用 HTML，必须以当前共用文件为基线，保留其他需求已确认的交互；此阶段不得覆盖共用文件。没有原始 HTML 时，保留现有飞书内容不动，并把新建的原型作为 candidate。
+3. 在 candidate 中完成用户要求的操作路径，使用模拟数据，不调用生产写接口。真实点击检查受影响的入口、分支、校验、取消和结果态。把 candidate 的本地链接及 3～8 步检查路径交用户审查。**用户明确说“原型通过”之前，不生成 plan.json、不调用 `edit.py review`、不改飞书原文档、版本共用附件或云效状态。**
+4. 用户不满意时，按反馈继续修改 candidate；若要求“回滚 / 恢复原状”，从 `baseline.html` 重新复制 candidate（或删除新建的 candidate），核对它与基线的 SHA-256 相同。共用文件和飞书原文档因未触碰而保持原状。不得用已经改过的 candidate 当回滚源。
+5. 用户批准原型后，固定 candidate 的 SHA-256。从**同一份已批准的 candidate**操作到需要的状态并截图，截图保存在该版本目录 `screenshots/` 下；不得重画另一套静态图。若后续更改 candidate，重新请用户验收并重截受影响图片。
+
+原型未通过时只交付 HTML 修改或回滚结果，不能跳到评审文档。原型通过后进入下一步；此时共用 / 原始 HTML 与版本文档的文件块仍保持基线。最终合并全部章节成功后，先将批准的 candidate 上传并替换版本文档的**同一个文件块**，再写回本地共用 HTML；基线副本继续保留。
+
+### 第 2 步 · 依据已批准原型生成 plan.json 并建评审子节点
 
 按「章节粒度」定位：找到能**完整包住**用户要改内容的**最小标题小节**（优先 H4，其次 H3，再 H2）。
 只重写这一节，其余不碰。为每个要改的小节写一份完整的**新版 Markdown（含标题本身）**。
@@ -63,12 +79,19 @@ python3 "$HOME/.claude/skills/prd-feishu-edit/edit.py" fetch "<target_url>"
 {
   "target_url": "https://xxx.feishu.cn/wiki/XXXXXXXX",
   "change_summary": "把 4.1 列表页的筛选项从 3 个改成 5 个",
+  "prototype_review": {
+    "source_html": "/项目/原有共用原型.html",
+    "baseline_html": "/项目/outputs/prd-prototypes/需求ID/时间戳/baseline.html",
+    "baseline_sha256": "修改前 HTML 的 SHA-256",
+    "candidate_html": "/项目/outputs/prd-prototypes/需求ID/时间戳/candidate.html",
+    "approved_sha256": "用户验收通过的 candidate SHA-256"
+  },
   "sections": [
     {
       "heading_level": 3,
       "heading_text": "4.1 列表页",
       "new_markdown": "### 4.1 列表页\n\n（这一整节改完后的完整 Markdown，含标题行本身；改动处打差异标记）\n\n筛选项共 {-3-}{+5+} 个。\n\n| 编号 | 名称 | ... |\n| --- | --- | ... |\n...",
-      "proto_html_files": ["/tmp/.../edit-proto-1.html"]
+      "proto_png_files": ["/项目/outputs/prd-prototypes/需求ID/时间戳/screenshots/01-列表.png"]
     }
   ]
 }
@@ -76,17 +99,43 @@ python3 "$HOME/.claude/skills/prd-feishu-edit/edit.py" fetch "<target_url>"
 
 字段说明：
 - `heading_level` / `heading_text`：**逐字取自 fetch 索引**，作为定位锚点。
-- `new_markdown`：这一小节改完后的**完整 Markdown**，**必须以该小节标题行开头**（如 `### 4.1 列表页`），
+- `new_markdown`：这一小节按用户意见修订后的**最终产品方案 Markdown**，**必须以该小节标题行开头**（如 `### 4.1 列表页`），
   到下一个同级或更高级标题之前的全部内容。粒度就是「替换整节」——所以没改的行也要照抄进来，
-  **只在真正动过的地方打差异标记**（见下节）。
+  **只在真正动过的地方打差异标记**（见下节）。正式正文的叙述基准必须是当前线上版本，而不是“原文档”；
+  `change_summary` 可写评审层面的修改说明，但 `new_markdown` 不得写文档编辑过程。
 - `keep_diff_marks`（可选，顶层）：默认 `false` —— 合并进原文档时把标记落地（红字变正式内容、
   划掉的内容真删除），PRD 保持干净。设 `true` 则原文档里也保留红字/划掉的痕迹（一般不需要，
   因为评审子节点已经永久留痕了）。
-- `proto_html_files`（可选）：本节若含视觉原型图 / 状态机，写这些原型图的 HTML 片段文件路径，
-  **顺序 = 它们在 `new_markdown` 里 `![](placeholder-N)` 出现的顺序**。
-  原型图 HTML 片段的写法、样式、渲染规则**完全等同 `prd-feishu` skill**（浅灰容器 + 白卡片 + 黄色 ★ 高亮新增字段），
-  脚本会用 Chrome 渲染成 PNG 并裁白边后上传。`new_markdown` 里图片位置用 `![原型图](placeholder-1)` 占位。
-  本节不含原型图就省略该字段或给 `[]`。
+- `prototype_review`：只要本次改了原型就必填。`source_html` 指向原始 / 共用 HTML；若原本没有 HTML，可省略 `source_html`、`baseline_html`、`baseline_sha256`，但仍保留已批准的 `candidate_html` 与 `approved_sha256`。脚本在 review / apply 前校验哈希，防止验收后换稿；合并全部成功后才将 candidate 写回 `source_html`。原始 `baseline.html` 保留以便回滚。
+- `shared_prototype_parent_url`（可选，顶层）：迭代版本文档的 wiki URL；填写时必须与需求 wiki 的直接父节点一致。原型合并后 `edit.py apply` 会在这个父节点更新唯一的 `共用交互原型.html` 文件块。找不到直接父级 docx 时停止并报告，不改放到需求节点。
+- `proto_png_files`：原型改动时使用已批准 candidate 的实际页面截图，**顺序 = `new_markdown` 中 `![](placeholder-N)` 的顺序**。不含图片的章节可省略。脚本直接上传这些 PNG，不再根据另一份 HTML 片段重画。`proto_html_files` 仅兼容既有旧计划；新的原型改动不得使用它，也不得与 `proto_png_files` 混用。
+- `preserve_trailing_images`（可选，章节级）：仅修改文字、且该节末尾已有原型图时设为 `true`。`new_markdown` 在原图位置逐张保留 `🖼 [原型图 — 见原文档对应位置]` 行；合并时只替换前面的文字块，原图片块及文件 token 原位保留。若图片不在节尾连续排列，脚本停止并要求缩小修改范围；不得重新上传旧图冒充原图。
+
+#### 先判断：线上现状，还是尚未开发的原方案
+
+生成 `new_markdown` 前，必须把实时 PRD 中的信息分成两类：
+
+1. **当前线上现状**：已经存在的功能、字段、流程。最终正文可以用“删除 / 新增 / 修改”描述相对线上版本的产品变化。
+2. **原 PRD 的拟议方案**：文档计划新增、但尚未开发上线的能力。用户取消或调整它时，不能在最终正文写
+   “本期删除原方案 / 删除查看环节 / 不再提供拟议功能”；应直接删掉或改写相关方案，并从线上现状重新描述最终要做什么。
+
+默认按“原 PRD 尚未开发”处理，除非实时文档或用户明确说明某能力已经上线。无法判断且会实质改变需求时才询问用户。
+
+例如，线上列表当前明文展示验证码，原 PRD 拟新增“查看验证码并邮件发送”，用户随后说“去掉查看验证码环节，改为创建时只显示一次”：
+
+```markdown
+<!-- 错误：把修文档的过程写进产品需求 -->
+{+本期删除创建后的“查看验证码”环节，改为只在新增弹窗展示。+}
+
+<!-- 正确：划掉原拟议方案，正文直接描述相对线上现状的最终方案 -->
+- {-操作列新增“查看验证码”按钮-}
+- {-点击按钮后将验证码发送到当前登录用户邮箱-}
+- {+列表删除“验证码”列，且不提供创建后的查看入口+}
+- {+验证码仅在新增 Agent 弹窗展示一次，有效期 30 分钟+}
+```
+
+如果原拟议功能整节取消，应把该节的**原标题、原段落、原列表项、原表格内容逐项标为删除**，不要用
+`{-删除原“查看验证码”章节及相关方案-}` 这类概括句替代原文。评审稿因此能看到相关功能被逐项划掉；合并后这些删除项会消失，正式 PRD 不留下文档修改痕迹。
 
 #### 差异标记怎么写（本 skill 的核心约定）
 
@@ -122,32 +171,33 @@ python3 "$HOME/.claude/skills/prd-feishu-edit/edit.py" fetch "<target_url>"
    要整段新增就每行各包一对；要整表新增就每个单元格各包一对。
 2. **未改动的内容一律不打标记。** 标记的密度就是「改动量」，全篇飘红等于没标。
 3. **小节标题行本身不要整条划掉**（会破坏下次定位的锚点）。要改标题文字就写成
-   `### 4.1 {-列表页-}{+列表与筛选+}`。
+   `### 4.1 {-列表页-}{+列表与筛选+}`。但在一个父章节的 `new_markdown` 内，若某个**下级功能小节整体从方案中取消**，
+   可以把该下级标题整行标为删除；合并时会连同其被删除的内容一起移除。最开头用于定位的锚点标题始终必须保留。
 4. 标记里可以正常用加粗、链接、行内代码，如 `{+**必填**+}`；标记符号本身不会出现在飞书里。
-5. 原型图（`![](placeholder-N)`）不支持标记；图变了就在图前后用文字说明「本次替换了原型图」。
+5. 原型图（`![](placeholder-N)`）不支持标记；直接在最终方案对应位置放置新的占位图即可。
+   只有产品阅读确有需要时才补充图片说明，不要加入“本次替换原型图”这类元叙述；评审节点的原内容 / 修改后对照已足以表达图片变化。
 
 然后建评审子节点：
 
 ```bash
-python3 "$HOME/.claude/skills/prd-feishu-edit/edit.py" review "<plan.json 路径>"
+python3 "<本 skill 目录>/edit.py" review "<plan.json 路径>"
 ```
 
 脚本在原 PRD 的 wiki 节点**下面**新建一个 `【修改建议】<原标题> · <时间>` 子节点，
-写入每个变更的「⬛ 原内容 vs 🟩 修改后（红字=新增，划掉=删除）」对照（含新原型图 PNG），
+写入每个变更的「⬛ 原内容 vs 🟩 修改后（红字=新增，划掉=删除）」对照（原型改动使用已批准 HTML 的截图），
 并把 `review_url` 回写进 plan.json。
 把这个 review_url 给用户，请他打开检查。**不要在用户确认前跑 apply。**
 
 给用户发链接时顺带说明图例：**红字 = 本次新增，划掉 = 本次删除，黑字 = 没动。**
 
-> review 模式要求原 PRD 是 wiki 节点（才能建子节点）。若原文档是裸 docx，脚本会提示——
-> 这种情况下与用户确认后可直接跳到 apply（不走评审子节点）。
+> review 模式要求原 PRD 是 wiki 节点（才能建子节点）。若原文档是裸 docx，先将修改建议写成可供用户审查的独立文档并取得明确批准，再处理合并；**涉及原型时不能跳过修改文档的审查**。当前脚本的原型合并要求 `review_url`，裸 docx 需先完成可审查的评审文档及相应脚本支持，不得直接调用 apply 绕过。
 
 ### 第 3 步 · apply —— 用户批准后合并
 
 用户看完子节点回复「同意 / 合并 / 就这么改」后：
 
 ```bash
-python3 "$HOME/.claude/skills/prd-feishu-edit/edit.py" apply "<plan.json 路径>"
+python3 "<本 skill 目录>/edit.py" apply "<plan.json 路径>"
 ```
 
 脚本会：
@@ -155,8 +205,20 @@ python3 "$HOME/.claude/skills/prd-feishu-edit/edit.py" apply "<plan.json 路径>
 - **把差异标记落地**：`{+…+}` 的内容转成普通正文留下，`{-…-}` 的内容真正删除（整行被划掉的连空行一起去掉），
   原文档保持干净、没有红字残留（除非 plan 里设了 `keep_diff_marks: true`）；
 - 其余部分（包括用户手动改的别处内容）**一律不动**；
+- 若计划包含已批准的 HTML 原型，所有章节合并成功后才把 candidate 写回原始 / 共用 HTML；原 baseline 继续保留。若合并中途失败，不覆盖原始 / 共用 HTML，明确报告飞书已写入到哪一步，先处理失败再重试；
+- 若包含原型，所有章节合并成功后先替换迭代版本文档中同一 `共用交互原型.html` 文件块，再更新本地共用 HTML。父级附件更新失败时，不更新云效状态，并明确报告“PRD 章节已合并、版本共用原型未更新”；不得在需求文档里补传独立副本。
 - 合并成功后在 review 子节点顶部加一条「✅ 已合并」横幅、标题改成 `【已合并】…`，
   **下方的红字/划掉对照原样保留**，作为本次改动的永久留痕（飞书无稳定的删节点 API，用户可手动删）。
+- 所有章节均合并成功后，按目标飞书 URL 匹配 `.aliyuncs.json` 中的需求，将云效状态更新为「已完成」，
+  并同步写回本地 `status`。`fetch` 和 `review` 均不得更新云效状态。
+
+### apply 后的云效状态联动
+
+- 按飞书 URL 中的 wiki/docx token 匹配需求，忽略 host、query 与尾斜杠差异。
+- 目标状态 identifier 必须从该需求的实际工作流按「已完成」动态解析，不得写死项目状态 ID。
+- 远端已是「已完成」时视为幂等成功，仍校准 `.aliyuncs.json`。
+- 没有 `.aliyuncs.json` 或没有对应需求时允许跳过，适配不挂云效的临时文档。
+- 已匹配到需求但状态更新失败时，必须明确报告“PRD 已合并、云效状态未更新”并以非零状态退出，不得把整个流程报告为成功。
 
 ## 铁律
 
@@ -166,23 +228,33 @@ python3 "$HOME/.claude/skills/prd-feishu-edit/edit.py" apply "<plan.json 路径>
 4. **改动处必须打差异标记。** 抄进来但没改的行不打标记；改了却不打标记 = 用户看不出你动了什么，
    等于绕过了评审。改写一处写成 `{-旧-}{+新+}`。
 5. **apply 前必须拿到用户明确批准。** review 只是提案，合并是不可逆写操作。
-6. **改动范围严格贴合用户描述。** 用户没提的小节不要顺手「优化」——那又会变成「改完把别人的还原了」。
+6. **只有 apply 全部成功后才能完成云效需求。** `fetch` / `review` 不改状态；章节合并中途失败也不改状态。
+7. **改动范围严格贴合用户描述。** 用户没提的小节不要顺手「优化」——那又会变成「改完把别人的还原了」。
+8. **正式 PRD 只写最终产品方案。** 不得出现“本期删除原方案 / 删除原章节 / 本次重写 / 本次替换原型图 / 根据修改意见”等面向文档编辑过程的句子。
+9. **删除拟议功能时逐项划原文。** 不得新增一条概括性的“删除说明”代替原功能内容；应对原句、原列表项、原表格单元格和必要的下级标题分别打删除标记。
+10. **删除词必须有线上依据。** 只有当前线上确实存在的能力，正式正文才写“删除 / 移除”；若只是原 PRD 曾计划新增但未上线，最终正文直接不包含该能力，或用“仅提供 / 不提供”描述最终边界。
+11. **原型未验收就不写评审文档。** 原型改动先交 candidate 让用户点测；明确通过后才写 plan 和 review。原型回滚时从未修改的 baseline 恢复，不能从飞书 PRD 或已改过的 candidate 反推。
+12. **评审批准不等于原型批准，反之亦然。** 两次确认分别针对 HTML 交互和飞书差异文档；缺任一次都不得执行后续写入。
+13. **父级共用文件只维护一份。** 需求文档只保留指向版本文档的入口；若发现旧需求级 HTML 附件，应在迁移核对后移除，避免把旧副本当作最新原型。截图只在对应需求章节经评审后更新。
 
 ## 前置检查
 
 - 飞书凭证：`~/.prd-feishu/config.json` 存在（否则让用户先 `/prd-feishu-init`）。
-- Chrome：仅当变更含原型图时才需要（`/Applications/Google Chrome.app/...`）。
+- 截图工具：原型改动用可操作浏览器打开已批准的 `candidate.html` 截图；旧计划里的 `proto_html_files` 才用本机 Chrome 渲染片段。
 
 ## 常见错误
 
 | 现象 | 原因 / 处理 |
 |------|-------------|
 | `找不到标题「X」(HN)` | 锚点文本或 level 与实时文档不符 → 重跑 fetch，用索引里的真实文本 |
-| `图片占位数与 PNG 数不一致` | `new_markdown` 里 `![](placeholder)` 个数 ≠ `proto_html_files` 个数 |
-| `review 模式要求 wiki 节点` | 原文档是裸 docx；与用户确认后直接 apply |
+| `图片占位数与 PNG 数不一致` | `new_markdown` 里 `![](placeholder)` 个数 ≠ `proto_png_files` 截图数（旧计划则对比 `proto_html_files`） |
+| 原型验收后 HTML 哈希不一致 | candidate 被继续编辑；重做受影响截图并重新请用户验收，不能沿用旧确认 |
+| 用户不满意新 HTML | 不创建 review；按反馈修改 candidate，或从 baseline 恢复。原始 / 共用 HTML 与飞书原文档保持不动 |
+| `review 模式要求 wiki 节点` | 原文档是裸 docx；先准备可审查的独立修改文档，取得第二次确认并补齐脚本支持，不直接 apply |
 | 合并后发现多删/少删 | 该节内有同级标题打断了区间 → 把锚点选到更小的子标题，或拆成多个 section |
 | `差异标记不配对` / `差异标记未闭合` | `{+`/`+}`、`{-`/`-}` 数量不等，或标记跨了行/单元格 → 在同一段落内闭合 |
-| `不允许整条删除小节标题` | 别把标题整行 `{-…-}`；只改标题文字就写 `### 4.1 {-旧名-}{+新名+}` |
+| `不允许整条删除锚点标题` | 最开头用于定位的章节标题必须保留；父章节内被取消的下级标题可以整行标为删除 |
+| 合并后正文出现“删除原方案 / 本次替换” | 把文档编辑过程误写进了产品方案；逐项划掉原拟议内容，并从线上现状直接描述最终方案 |
 | 评审节点里颜色不是红色 | 飞书 `text_color` 取值 1~7（1 红/2 橙/3 黄/4 绿/5 蓝/6 紫/7 灰），<br>在 `~/.prd-feishu/config.json` 加 `"diff_add_color": N` / `"diff_del_color": N` 改 |
 
 ## 与其它 skill 的关系

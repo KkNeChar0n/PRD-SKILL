@@ -1,17 +1,18 @@
 #!/bin/bash
 # PRD-SKILL Installer
-# 安装 PRD-SKILL 套件下全部 12 个 skill 到 Claude Code（~/.claude/skills/）
+# 安装 PRD-SKILL 套件下的 skill；默认安装到 Claude Code，可用 SKILLS_ROOT 指定其他目录。
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SKILLS_ROOT="$HOME/.claude/skills"
+SKILLS_ROOT="${SKILLS_ROOT:-$HOME/.claude/skills}"
 
 SKILLS=(
   # PRD 生成与发布
   "prd"
   "prd-feishu-init"
   "prd-feishu"
+  "prd-feishu-edit"
   "prd-feishu-batch"
   # 验收清单与迭代报告
   "uat-checklist"

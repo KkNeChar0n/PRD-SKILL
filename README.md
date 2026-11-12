@@ -1,19 +1,20 @@
 # PRD-SKILL
 
-一套 Claude Code 技能插件，覆盖 **Vibe Coding 协作 SOP** 的需求→研发→测试→验收四阶段全流程，把云效任务管理、飞书 PRD 撰写、验收清单、灰度/回归报告等高频协作动作下沉为可一键调用的 skill。
+一套 PRD 协作技能，覆盖需求撰写、飞书发布、局部修改、验收清单及灰度/回归报告。云效相关技能在独立仓库维护。
 
 完整 SOP 流程文档见 [`docs/SOP.html`](./docs/SOP.html)（下载后浏览器打开）。
 
 ---
 
-## 一、Skill 一览（共 7 个）
+## 一、Skill 一览（共 8 个）
 
 本仓库聚焦"飞书 + 验收清单 + 报告"链路；云效侧的 `/aliyuncs:*` 系列是独立 skill，**不在本仓库范围**，按需另行安装。
 
 | 阶段 | Skill | 作用 |
 |---|---|---|
 | **需求** | `/prd-feishu-init` | 一次性初始化飞书自建应用凭证，存到 `~/.prd-feishu/config.json` |
-| | `/prd-feishu` | 按需求标识或飞书 URL 生成完整 PRD，写入飞书 docx，自动向上回链 |
+| | `/prd-feishu` | 先制作并验收可操作 HTML 原型，再撰写完整 PRD；原型集中放在迭代版本文档，需求文档按章节插入截图 |
+| | `/prd-feishu-edit` | 局部修改已发布的 PRD：先验收原型改动，再审查差异文档，批准后合并 |
 | | `/prd-feishu-batch` | 批量把本地 `PRD_*.html` 写入飞书父节点下的预建子节点（按标题模糊匹配） |
 | | `/prd` | 离线生成 HTML 格式 PRD（含内联编辑器，无需飞书） |
 | **测试&验收** | `/uat-checklist` | 从飞书 PRD 自动生成验收清单（飞书多维表格 Bitable），含「测试/灰度/线上」三轮勾选列 |
@@ -61,7 +62,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-安装会把 `skills/` 下全部 7 个 skill 复制到 `~/.claude/skills/`。
+默认把 8 个 skill 复制到 `~/.claude/skills/`。在 Codex 环境中可用 `SKILLS_ROOT="$HOME/.agents/skills" ./install.sh` 指定安装目录。
 
 ## 四、卸载
 
@@ -112,13 +113,15 @@ chmod +x uninstall.sh
 /prd-feishu 应用管理详情页
 ```
 
-skill 按需求标题在 `.aliyuncs.json` 模糊匹配，找到对应飞书空节点，写入完整 PRD（含产品架构图、功能清单、状态机 SVG → PNG、原型图 PNG）。父节点目录自动追加新 PRD 链接 + 需求目标摘要。
+skill 按需求标题在 `.aliyuncs.json` 匹配对应飞书空节点。先制作可操作的单文件 HTML 原型并交用户验收，再依据该原型写 PRD、截取对应页面状态插图。共用 HTML 放在迭代版本文档，需求文档只保留版本文档链接；发布完成后按匹配结果同步云效。
 
 如果不联动云效，可直接传飞书空节点 URL：
 
 ```
 /prd-feishu https://xxx.feishu.cn/wiki/{empty_node_token} 应用管理详情页
 ```
+
+修改已发布的 PRD 使用 `/prd-feishu-edit`：涉及原型时先修改候选 HTML 并验收，再创建飞书差异评审子节点；用户批准评审后才合并正文与版本共用 HTML。纯文字规则修改直接进入差异评审。
 
 ### 6.3 生成验收清单（Bitable）
 
@@ -171,7 +174,7 @@ skill 通过 `AskUserQuestion` 逐项收集：灰度时间窗、灰度策略、�
    3.2 功能清单（编号|名称|类型|说明 表格）
 4. 需求详述
    4.x.1 状态机（SVG 泳道图 → PNG，仅在有真实业务状态流转时画）
-   4.x.2 原型图（筛选区/列表区/表单区表格 + 视觉原型 PNG）
+   4.x.2 原型图（筛选区/列表区/表单区表格 + 已验收 HTML 的页面截图）
    4.x.3 逻辑补充（仅复杂业务规则时写）
 ```
 

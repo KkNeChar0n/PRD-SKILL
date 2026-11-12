@@ -14,22 +14,35 @@ prd-feishu-edit —— 对「已发布到飞书的 PRD」做外科手术式局�
   review <plan.json>
       在原 PRD 的 wiki 节点下新建一个「修改建议」子节点，写入
       每个变更的「原内容 vs 修改后」对照，供用户评审。不动原文档。
+      原型改动使用已批准的 candidate.html 截图，并校验 HTML / 基线哈希。
       new_markdown 里的 {+新增+} 渲染成红色字体、{-删除-} 渲染成灰色划掉，
       一眼能看出这一节到底改了什么。成功后把 review_url 回写进 plan.json。
 
   apply  <plan.json>
       用户批准后调用：以实时文档为准，逐节定位标题锚点 → 删除该节旧块区间 →
       在原位插入新块（含原型图 PNG 上传绑定）。其余部分一律不动。
+      全部章节成功后，才把已批准的 candidate.html 写回原始 / 共用 HTML。
       默认把差异标记「落地」：新增文字转普通样式、被划掉的内容真正删除，
       原文档保持干净（plan 里加 "keep_diff_marks": true 可保留红字/划掉痕迹）。
       成功后在 review 子节点顶部加「已合并」横幅，差异对照保留作留痕。
 
 plan.json 结构见本目录 SKILL.md。
 """
-import copy, json, os, re, sys, time, subprocess, datetime
+import copy, json, os, re, sys, time, subprocess, datetime, hashlib, stat
 import urllib.parse as up
 from pathlib import Path
 import requests
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'prd-feishu'))
+from shared_prototype import (
+    SharedPrototypeError,
+    resolve_iteration_parent,
+    sync_shared_prototype,
+)
+from aliyuncs_status import (
+    find_aliyuncs_config,
+    match_requirement,
+    sync_requirement_status,
+)
 
 # ---------------- 配置 ----------------
 CONFIG = json.load(open(os.path.expanduser('~/.prd-feishu/config.json')))
@@ -305,7 +318,7 @@ def render_protos(proto_html_files, workdir):
         hf = Path(hf)
         if not hf.exists():
             die(f'✗ 原型图 HTML 不存在: {hf}')
-        png = workdir / f'edit-proto-{i}.png'
+        png = workdir / f'edit-proto-{hf.stem}.png'
         cmd = [CHROME, '--headless', '--disable-gpu', '--no-sandbox',
                '--hide-scrollbars', '--window-size=940,3000',
                '--default-background-color=ffffffff',
@@ -327,6 +340,74 @@ def render_protos(proto_html_files, workdir):
         print(f'  ✓ 原型图 [{i}] {png.name}')
         png_paths.append(png)
     return png_paths
+
+
+def file_sha256(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def validate_prototype_review(plan):
+    """Fail before remote writes if an approved interactive prototype has changed."""
+    has_pngs = any(sec.get('proto_png_files') for sec in plan['sections'])
+    review = plan.get('prototype_review')
+    if has_pngs and not review:
+        die('✗ 使用 proto_png_files 时必须提供 prototype_review 和已批准 HTML 的哈希')
+    if not review:
+        return
+    if not has_pngs:
+        die('✗ prototype_review 缺少已批准 HTML 的截图（proto_png_files）')
+    candidate = Path(review.get('candidate_html', ''))
+    approved = review.get('approved_sha256', '')
+    if not approved or not candidate.is_file() or file_sha256(candidate) != approved:
+        die('✗ 已批准原型的 candidate_html 不存在或 SHA-256 已改变；请重新验收并截图')
+    source_name = review.get('source_html')
+    if source_name:
+        source = Path(source_name)
+        baseline = Path(review.get('baseline_html', ''))
+        baseline_hash = review.get('baseline_sha256', '')
+        if source.is_symlink() or not baseline_hash or not source.is_file() or not baseline.is_file():
+            die('✗ 原始 HTML / baseline.html 缺失或为不支持的符号链接，停止评审或合并')
+        if file_sha256(baseline) != baseline_hash or file_sha256(source) != baseline_hash:
+            die('✗ 原始 / 共用 HTML 已改变，或基线哈希不符；请以最新文件重新建立原型版本')
+
+
+def section_proto_pngs(section, workdir):
+    screenshots = section.get('proto_png_files', [])
+    fragments = section.get('proto_html_files', [])
+    if screenshots and fragments:
+        die('✗ proto_png_files 与 proto_html_files 不得混用')
+    if fragments:
+        return render_protos(fragments, workdir)  # 兼容既有计划
+    result = []
+    for item in screenshots:
+        path = Path(item)
+        if not path.is_file() or path.read_bytes()[:8] != b'\x89PNG\r\n\x1a\n':
+            die(f'✗ 已批准原型截图不存在或不是 PNG: {path}')
+        result.append(path)
+    return result
+
+
+def promote_approved_prototype(plan):
+    """After all Feishu sections merge, atomically promote the approved candidate."""
+    review = plan.get('prototype_review') or {}
+    source_name = review.get('source_html')
+    if not source_name:
+        return
+    validate_prototype_review(plan)
+    source = Path(source_name)
+    candidate = Path(review['candidate_html'])
+    temporary = source.with_name(f'.{source.name}.{os.getpid()}.tmp')
+    try:
+        with open(temporary, 'wb') as output:
+            output.write(candidate.read_bytes())
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(temporary, stat.S_IMODE(source.stat().st_mode))
+        os.replace(temporary, source)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+    print(f'  ✓ 已批准 HTML 写回原始 / 共用文件：{source}')
 
 
 # ---------------- 差异标记处理 ----------------
@@ -404,6 +485,14 @@ def process_diff_marks(blocks, first_level, mode):
     两种模式下标记符号本身都会从正文里消失。
     """
     ordered, id_map, parent_of = _walk_blocks(blocks, first_level)
+    # new_markdown 必须以当前替换章节的锚点标题开头。该标题用于后续定位，不能整条删除；
+    # 但父章节内尚未开发、现已从方案中取消的下级标题，允许在评审中整行划掉，
+    # resolve 时连同其已标记删除的内容一起移除，避免正式 PRD 残留空标题或“删除原方案”元叙述。
+    protected_heading_id = next(
+        (bid for bid in first_level
+         if bid in id_map and heading_level(id_map[bid]) is not None),
+        None,
+    )
     drop = set()
     for b in ordered:
         cont = _text_container(b)
@@ -440,7 +529,10 @@ def process_diff_marks(blocks, first_level, mode):
         now_empty = not any((e.get('text_run') or {}).get('content') for e in new_elems)
         if mode == 'resolve' and had_text and now_empty:
             if heading_level(b) is not None:
-                die(f'✗ 不允许整条删除小节标题：请保留标题行本身，只删标题下的内容。')
+                if b['block_id'] == protected_heading_id:
+                    die('✗ 不允许整条删除锚点标题：请保留 new_markdown 开头用于定位的章节标题。')
+                drop.add(b['block_id'])
+                continue
             parent = parent_of.get(b['block_id'])
             in_cell = parent is not None and parent.get('block_type') == BT_TABLE_CELL
             if b.get('block_type') in DROPPABLE and not b.get('children') and not in_cell:
@@ -482,7 +574,7 @@ def insert_markdown(doc_id, markdown, index, png_paths, diff_mode='none'):
             prop.pop('merge_info', None)
     n_img = sum(1 for b in blocks if b.get('block_type') == BT_IMAGE)
     if n_img != len(png_paths):
-        die(f'✗ 该段图片占位数({n_img}) 与提供的 PNG 数({len(png_paths)}) 不一致，检查 proto_html_files')
+        die(f'✗ 该段图片占位数({n_img}) 与提供的 PNG 数({len(png_paths)}) 不一致，检查 proto_png_files / proto_html_files')
 
     r = requests.post(f'{BASE}/docx/v1/documents/{doc_id}/blocks/{doc_id}/descendant',
                       headers={**HEAD, 'Content-Type': 'application/json'},
@@ -511,9 +603,16 @@ def insert_markdown(doc_id, markdown, index, png_paths, diff_mode='none'):
             print(f'  [{i}] ✗ 图片上传失败: {up_resp}')
             continue
         ft = up_resp['data']['file_token']
+        # 读 PNG 真实尺寸并一并写回 image block，否则 block 保持默认 100x100
+        try:
+            from PIL import Image
+            with Image.open(p) as _img:
+                _w, _h = _img.size
+        except Exception:
+            _w, _h = 940, 600
         r = requests.patch(f'{BASE}/docx/v1/documents/{doc_id}/blocks/{bid}',
                            headers={**HEAD, 'Content-Type': 'application/json'},
-                           json={'replace_image': {'token': ft}})
+                           json={'replace_image': {'token': ft, 'width': _w, 'height': _h}})
         if r.json().get('code') == 0:
             ok += 1
         else:
@@ -564,6 +663,7 @@ def cmd_fetch(url):
 # ================= 子命令：review =================
 def cmd_review(plan_path):
     plan = json.load(open(plan_path))
+    validate_prototype_review(plan)
     init_token()
     info = resolve_url(plan['target_url'])
     if info['url_type'] != 'wiki' or not info['node']:
@@ -604,11 +704,8 @@ def cmd_review(plan_path):
         md_parts.append(orig_md if orig_md.strip() else '_（原为空）_')
         md_parts.append('\n### 🟩 修改后（红字=新增，划掉=删除，黑字=未动）\n')
         md_parts.append(new_md)
-        # 渲染该节的原型图（若有）
-        protos = sec.get('proto_html_files', [])
-        if protos:
-            pngs = render_protos(protos, work)
-            all_pngs.extend(pngs)
+        # 原型变更使用已批准 HTML 的截图；旧计划仍可渲染 HTML 片段。
+        all_pngs.extend(section_proto_pngs(sec, work))
 
     review_md = '\n\n'.join(md_parts)
 
@@ -647,9 +744,20 @@ def cmd_review(plan_path):
 # ================= 子命令：apply =================
 def cmd_apply(plan_path):
     plan = json.load(open(plan_path))
+    validate_prototype_review(plan)
+    if plan.get('prototype_review') and not plan.get('review_url'):
+        die('✗ 原型改动尚无修改建议文档；先运行 review 并取得用户对文档的确认')
     init_token()
     info = resolve_url(plan['target_url'])
     doc_id = info['doc_id']
+    prototype_review = plan.get('prototype_review')
+    iteration_parent = None
+    if prototype_review:
+        try:
+            iteration_parent = resolve_iteration_parent(
+                BASE, HEAD, plan['target_url'], plan.get('shared_prototype_parent_url'))
+        except SharedPrototypeError as error:
+            die(f'✗ 版本共用原型父节点校验失败，PRD 尚未修改：{error}')
 
     work = Path(f'/tmp/prd-feishu-edit-apply-{datetime.datetime.now().strftime("%Y%m%d-%H%M%S")}')
 
@@ -668,28 +776,63 @@ def cmd_apply(plan_path):
         if start is None:
             die(f'✗ 变更{si}：在实时文档里找不到标题「{htext}」(H{lvl})，已中止。'
                 f'（其余变更未提交，可重新 fetch 后重试）')
-        n_del = end - start
-        print(f'\n[变更{si}] 「{htext}」(H{lvl})  替换根级块 [{start}, {end}) 共 {n_del} 块')
+        # 原型变更使用已批准 HTML 的截图；旧计划仍可渲染 HTML 片段。
+        pngs = section_proto_pngs(sec, work)
+        markdown = sec['new_markdown']
+        delete_end = end
+        if sec.get('preserve_trailing_images'):
+            if pngs:
+                die(f'✗ 变更{si}：保留原图时不能同时提供新原型图')
+            marker = '🖼 [原型图 — 见原文档对应位置]'
+            count = sum(line.strip() == marker for line in markdown.splitlines())
+            if count == 0 or end - start <= count:
+                die(f'✗ 变更{si}：保留原图需在 new_markdown 中逐张标记原图位置')
+            nonempty = [line.strip() for line in markdown.splitlines() if line.strip()]
+            if nonempty[-count:] != [marker] * count:
+                die(f'✗ 变更{si}：原图标记必须连续放在该节末尾')
+            tail = root_children[end - count:end]
+            if any(b.get('block_type') != BT_IMAGE for b in tail):
+                die(f'✗ 变更{si}：原图不是本节末尾连续图片块，已停止以免误删')
+            delete_end = end - count
+            markdown = '\n'.join(
+                line for line in markdown.splitlines() if line.strip() != marker)
 
-        # 先渲染该节原型图
-        protos = sec.get('proto_html_files', [])
-        pngs = render_protos(protos, work) if protos else []
+        n_del = delete_end - start
+        print(f'\n[变更{si}] 「{htext}」(H{lvl})  替换根级块 [{start}, {delete_end}) 共 {n_del} 块')
 
         # 删除旧区间
         if n_del > 0:
             r = requests.delete(
                 f'{BASE}/docx/v1/documents/{doc_id}/blocks/{doc_id}/children/batch_delete',
                 headers={**HEAD, 'Content-Type': 'application/json'},
-                json={'start_index': start, 'end_index': end})
+                json={'start_index': start, 'end_index': delete_end})
             d = r.json()
             if d.get('code') != 0:
                 die(f'✗ 删除旧块失败: {d}')
             time.sleep(0.4)
 
         # 在原位插入新块
-        insert_markdown(doc_id, sec['new_markdown'], start, pngs, diff_mode=diff_mode)
+        insert_markdown(doc_id, markdown, start, pngs, diff_mode=diff_mode)
         print(f'  ✓ 变更{si} 已合并')
         time.sleep(0.4)
+
+    # 所有章节合并成功后，同步需求直接父级版本文档中的唯一 HTML 文件块。
+    # PRD 中已统一指向版本文档；同步失败时不能将本地原型或云效状态报告为完成。
+    if prototype_review:
+        try:
+            shared_result = sync_shared_prototype(
+                BASE, HEAD, iteration_parent,
+                prototype_review['candidate_html'], prototype_review['approved_sha256'])
+            print(f'  ✓ 版本文档共用原型已更新：{shared_result["url"]} '
+                  f'(SHA-256 {shared_result["sha256"][:16]}...)')
+        except SharedPrototypeError as error:
+            die(f'✗ PRD 章节已合并，但版本共用原型更新失败，云效状态未更新：{error}', 2)
+
+    # 远端共享附件更新成功后，才更新原始 / 共用 HTML；基线副本保持不变。
+    try:
+        promote_approved_prototype(plan)
+    except OSError as error:
+        die(f'✗ PRD 已合并，但批准的 HTML 写回失败: {error}', 2)
 
     # 在 review 子节点顶部插入「已合并」横幅（保留下方的差异对照作为改动留痕）
     rn_token = plan.get('review_node_token')
@@ -715,6 +858,29 @@ def cmd_apply(plan_path):
             print('  ⚠ review 子节点标记失败（不影响合并结果），可手动删除该节点')
         except Exception as e:
             print(f'  ⚠ review 子节点标记异常（不影响合并结果）: {e}')
+
+    # 所有批准的章节都成功合并后，再将对应云效需求标记为已完成。
+    print('\n[云效] 更新对应需求状态 ...')
+    acfg_path = find_aliyuncs_config([plan_path, Path.cwd()])
+    if not acfg_path:
+        print('  跳过：未找到 .aliyuncs.json，无法定位对应云效需求')
+    else:
+        acfg = json.load(open(acfg_path))
+        matched = match_requirement(acfg, plan['target_url'])
+        if not matched:
+            print('  跳过：.aliyuncs.json 中没有与目标飞书文档对应的需求')
+        else:
+            requirement_id = matched['identifier']
+            try:
+                old_status, status_changed = sync_requirement_status(
+                    acfg_path, acfg, matched, '已完成')
+            except Exception as e:
+                die(f'✗ PRD 已合并，但云效需求状态更新失败: {e}', 2)
+            if status_changed:
+                print(f'  ✓ 云效需求 {requirement_id[:10]}... 状态：'
+                      f'{old_status or "（未知）"} → 已完成')
+            else:
+                print(f'  - 云效需求 {requirement_id[:10]}... 已是“已完成”，本地状态已同步')
 
     print('\n' + '=' * 60)
     print('✓ 已按批准的变更合并到原文档，其余部分原样保留：')

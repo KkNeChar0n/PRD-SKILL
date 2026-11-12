@@ -15,7 +15,7 @@ allowed-tools: Read, Write, Bash, Glob, Grep, AskUserQuestion
 
 期望格式：`<local_dir> <parent_wiki_url>`
 
-- `local_dir`：本地目录路径（例如 `/Users/charon/TRSA/需求文档`），目录里放 `PRD_*.html` 文件
+- `local_dir`：本地目录路径（例如 `<项目目录>/需求文档`），目录里放 `PRD_*.html` 文件
 - `parent_wiki_url`：飞书知识库父节点 URL（例如 `https://xxx.feishu.cn/wiki/J9RwwLcqNi3pTNkSiH9cLseBn9d`），父节点下的子节点是预先建好的空 docx，每个对应一份 PRD
 
 ## 前置条件
@@ -83,7 +83,11 @@ def normalize(s):
 ### 7. 串行调用 `publish.py`
 
 ```bash
-PUB="$HOME/.claude/skills/prd-feishu/publish.py"
+PUB=""
+for root in "$HOME/.agents/skills" "$HOME/.claude/skills" "$HOME/.codex/skills"; do
+    if [ -f "$root/prd-feishu/publish.py" ]; then PUB="$root/prd-feishu/publish.py"; break; fi
+done
+[ -n "$PUB" ] || { echo "未找到 prd-feishu/publish.py" >&2; exit 1; }
 for 每个 (HTML_PATH, WIKI_URL) in 确认列表:
     python3 "$PUB" "$HTML_PATH" "$WIKI_URL"
 ```

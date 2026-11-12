@@ -1,15 +1,16 @@
 #!/bin/bash
 # PRD-SKILL Uninstaller
-# 卸载 PRD-SKILL 套件下全部 12 个 skill
+# 卸载 PRD-SKILL 套件下的 skill；默认从 Claude Code 卸载，可用 SKILLS_ROOT 指定其他目录。
 
 set -e
 
-SKILLS_ROOT="$HOME/.claude/skills"
+SKILLS_ROOT="${SKILLS_ROOT:-$HOME/.claude/skills}"
 
 SKILLS=(
   "prd"
   "prd-feishu-init"
   "prd-feishu"
+  "prd-feishu-edit"
   "prd-feishu-batch"
   "uat-checklist"
   "gray-report"

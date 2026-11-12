@@ -1,17 +1,80 @@
 #!/usr/bin/env python3
 """Publish an existing PRD HTML file to Feishu Docs."""
-import json, os, re, sys, time, html, subprocess, datetime, shutil
+import argparse, hashlib, json, os, re, sys, time, html, subprocess, datetime, shutil
 from pathlib import Path
+from urllib.parse import quote, unquote, urlsplit
 import requests
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag, Comment
+from aliyuncs_status import (
+    build_client,
+    find_aliyuncs_config,
+    match_requirement,
+    sync_requirement_status,
+)
+from shared_prototype import (
+    SharedPrototypeError,
+    list_blocks,
+    resolve_iteration_parent,
+    sync_shared_prototype,
+)
 
 # ---------------- 配置与参数 ----------------
-HTML_PATH = sys.argv[1] if len(sys.argv) > 1 else None
-TARGET_URL = sys.argv[2] if len(sys.argv) > 2 else None
-if not HTML_PATH or not os.path.exists(HTML_PATH):
-    print(f'用法: {sys.argv[0]} <PRD html 路径> <飞书文档 URL>'); sys.exit(1)
-if not TARGET_URL:
-    print(f'用法: {sys.argv[0]} <PRD html 路径> <飞书文档 URL>'); sys.exit(1)
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('html_path', help='PRD HTML 路径')
+parser.add_argument('target_url', help='飞书 docx/wiki URL')
+parser.add_argument('--prototype-html', help='用户审查通过的单文件 HTML 原型')
+parser.add_argument('--prototype-url', help='相同 HTML 的稳定 HTTPS URL，用于飞书 iframe')
+parser.add_argument('--prototype-attachment', help='用户审查通过的 HTML 原型，上传或替换到需求的上一层版本文档')
+parser.add_argument('--prototype-parent-url', help='可选：显式指定需求的直接父级版本 wiki 文档，用于核对归属')
+parser.add_argument('--prepare-only', action='store_true', help='只生成 Markdown 和原型图，检查后退出，不调用飞书 API')
+args = parser.parse_args()
+HTML_PATH, TARGET_URL = args.html_path, args.target_url
+if not os.path.isfile(HTML_PATH):
+    parser.error(f'PRD HTML 不存在: {HTML_PATH}')
+if bool(args.prototype_html) != bool(args.prototype_url):
+    parser.error('--prototype-html 与 --prototype-url 必须同时提供')
+if args.prototype_attachment and (args.prototype_html or args.prototype_url):
+    parser.error('--prototype-attachment 与 URL 内嵌方式只能选择一种')
+
+PROTOTYPE_URL = args.prototype_url
+PROTOTYPE_SHA256 = None
+ATTACHMENT_PATH = Path(args.prototype_attachment) if args.prototype_attachment else None
+if ATTACHMENT_PATH:
+    if not ATTACHMENT_PATH.is_file():
+        parser.error(f'交互原型不存在: {ATTACHMENT_PATH}')
+    prototype_bytes = ATTACHMENT_PATH.read_bytes()
+    if not prototype_bytes or b'<html' not in prototype_bytes.lower():
+        parser.error('--prototype-attachment 必须是完整的非空 HTML 文件')
+    PROTOTYPE_SHA256 = hashlib.sha256(prototype_bytes).hexdigest()
+    print(f'交互原型附件已核对: {ATTACHMENT_PATH} SHA-256={PROTOTYPE_SHA256[:16]}...')
+if PROTOTYPE_URL:
+    prototype_path = Path(args.prototype_html)
+    if not prototype_path.is_file():
+        parser.error(f'交互原型不存在: {prototype_path}')
+    parsed = urlsplit(PROTOTYPE_URL)
+    if parsed.scheme != 'https' or not parsed.netloc or parsed.username or parsed.password:
+        parser.error('--prototype-url 必须是无内嵌凭证的 HTTPS 地址')
+    prototype_bytes = prototype_path.read_bytes()
+    if not prototype_bytes or b'<html' not in prototype_bytes.lower():
+        parser.error('--prototype-html 必须是完整的非空 HTML 文件')
+    # 在清空飞书文档之前检查托管文件与已批准文件确实相同。
+    try:
+        hosted = requests.get(PROTOTYPE_URL, timeout=20)
+        hosted.raise_for_status()
+    except requests.RequestException as exc:
+        parser.error(f'原型托管地址不可访问: {exc}')
+    PROTOTYPE_SHA256 = hashlib.sha256(prototype_bytes).hexdigest()
+    if hashlib.sha256(hosted.content).hexdigest() != PROTOTYPE_SHA256:
+        parser.error('托管网页内容与已审查的 prototype.html 不一致，请先同步同一版本')
+    xfo = hosted.headers.get('X-Frame-Options', '').upper()
+    csp = hosted.headers.get('Content-Security-Policy', '')
+    frame_ancestors = next((v.strip() for v in csp.split(';')
+                            if v.strip().lower().startswith('frame-ancestors')), '')
+    if xfo in ('DENY', 'SAMEORIGIN') or "'none'" in frame_ancestors.lower():
+        parser.error('原型托管页的响应头禁止 iframe 内嵌')
+    if frame_ancestors and "'self'" in frame_ancestors.lower() and 'feishu.cn' not in frame_ancestors.lower():
+        parser.error('原型托管页的 CSP frame-ancestors 未允许飞书域名')
+    print(f'交互原型已核对: {prototype_path} SHA-256={PROTOTYPE_SHA256[:16]}...')
 
 CONFIG = json.load(open(os.path.expanduser('~/.prd-feishu/config.json')))
 APP_ID, APP_SECRET = CONFIG['app_id'], CONFIG['app_secret']
@@ -35,6 +98,8 @@ soup = BeautifulSoup(raw, 'html.parser')
 # 移除工具栏相关元素
 for el in soup.select('#prd-toolbar, [data-prd-tool]'):
     el.decompose()
+for el in soup.find_all(string=lambda value: isinstance(value, Comment)):
+    el.extract()
 
 title_el = soup.find('h1')
 PRD_TITLE = title_el.get_text(strip=True) if title_el else Path(HTML_PATH).stem
@@ -75,6 +140,12 @@ def is_prototype_div(el):
         'background:#dbe9f4',
     ])
 
+def is_screenshot_figure(el):
+    return el.name == 'figure' and bool(el.get('data-prd-screenshot'))
+
+def is_visual_item(el):
+    return is_screenshot_figure(el) or is_prototype_div(el)
+
 # 判断一个 div 是不是「产品架构图」（mindmap 容器）
 def is_mindmap_div(el):
     if el.name != 'div':
@@ -82,15 +153,45 @@ def is_mindmap_div(el):
     style = (el.get('style') or '').replace(' ', '')
     return 'background:#fafafa' in style and el.find('ul') is not None
 
-# 收集原型图列表（顺序很重要）
-proto_divs = []
-for el in body.find_all(is_prototype_div):
-    # 跳过嵌套的（只取最外层）
-    if any(parent in [d for d in proto_divs] for parent in el.parents):
+# 收集页面截图与旧式视觉容器，按 PRD 中出现的顺序绑定图片块。
+proto_items = []
+for el in body.find_all(is_visual_item):
+    if any(parent in proto_items for parent in el.parents):
         continue
-    proto_divs.append(el)
+    proto_items.append(el)
 
-print(f'找到原型图块: {len(proto_divs)} 个')
+print(f'找到原型图块: {len(proto_items)} 个（HTML 截图 {sum(is_screenshot_figure(x) for x in proto_items)} 个）')
+
+for item in proto_items:
+    if not is_screenshot_figure(item):
+        continue
+    if not PROTOTYPE_SHA256:
+        parser.error('PRD 含 HTML 原型截图时，须传入 --prototype-attachment 或 --prototype-html/--prototype-url')
+    if item.get('data-prototype-sha256') != PROTOTYPE_SHA256:
+        parser.error('原型截图记录的 HTML 哈希与本次交付的原型文件不一致')
+    shot = (Path(HTML_PATH).resolve().parent / item['data-prd-screenshot']).resolve()
+    if shot.suffix.lower() != '.png' or not shot.is_file():
+        parser.error(f'原型截图不存在或不是 PNG: {shot}')
+    if not item.get('data-prototype-state'):
+        parser.error('每张原型截图须标明 data-prototype-state，便于核对页面状态')
+    image_el = item.find('img')
+    if not image_el or image_el.get('src') != item['data-prd-screenshot']:
+        parser.error('原型截图的 img src 必须与 data-prd-screenshot 指向同一 PNG')
+
+if PROTOTYPE_SHA256:
+    for heading in body.find_all('h4'):
+        if '原型图' not in heading.get_text(strip=True):
+            continue
+        section_items = []
+        for sibling in heading.next_siblings:
+            if isinstance(sibling, Tag) and sibling.name in ('h3', 'h4'):
+                break
+            if isinstance(sibling, Tag):
+                section_items.extend(x for x in sibling.find_all(is_visual_item, recursive=True))
+                if is_visual_item(sibling):
+                    section_items.append(sibling)
+        if not section_items:
+            parser.error(f'{heading.get_text(strip=True)} 缺少对应的原型截图；若本节只有规则说明，请改用准确的小节名称')
 
 # ---------------- 2. HTML → Markdown 转换 ----------------
 def md_inline(node):
@@ -177,10 +278,12 @@ def md_block(el):
         return s if s else ''
 
     # 原型图占位
-    if is_prototype_div(el):
-        idx = proto_divs.index(el) + 1
-        # 提取图说明（最后一个 div with text-align:center 或最后的 div）
-        caption_el = el.select_one('div[style*="text-align:center"]') or el.find_all('div')[-1] if el.find_all('div') else None
+    if is_visual_item(el):
+        idx = proto_items.index(el) + 1
+        # 页面截图用 figcaption；旧式视觉容器沿用原有说明提取。
+        caption_el = (el.find('figcaption') if is_screenshot_figure(el) else
+                      (el.select_one('div[style*="text-align:center"]') or
+                       (el.find_all('div')[-1] if el.find_all('div') else None)))
         caption = caption_el.get_text(' ', strip=True) if caption_el else ''
         cap_md = f'\n_{caption}_\n' if caption.startswith('图：') else ''
         return f'\n![原型图{idx}](placeholder-{idx})\n{cap_md}'
@@ -235,8 +338,8 @@ md_path = WORK / 'final.md'
 md_path.write_text(MARKDOWN, encoding='utf-8')
 print(f'Markdown 已生成: {md_path} ({len(MARKDOWN)} 字符)')
 
-# ---------------- 3. 把每个原型图 div 包装为独立 HTML，渲染 PNG ----------------
-print(f'\n开始渲染 {len(proto_divs)} 张原型图...')
+# ---------------- 3. 收集已审查截图，渲染旧式视觉容器 ----------------
+print(f'\n开始准备 {len(proto_items)} 张原型图...')
 
 # 模板（与 PRD 共享样式）
 HTML_WRAPPER = """<!DOCTYPE html>
@@ -251,37 +354,32 @@ HTML_WRAPPER = """<!DOCTYPE html>
 
 png_paths = []
 png_dims = []  # 每张原型图 PNG 的 (宽, 高) 像素，用于设置飞书图片块显示尺寸
-for i, div in enumerate(proto_divs, 1):
-    html_file = WORK / f'proto-{i}.html'
+for i, item in enumerate(proto_items, 1):
     png_file = WORK / f'proto-{i}.png'
-    html_file.write_text(HTML_WRAPPER.format(content=str(div)), encoding='utf-8')
-    # 渲染
-    cmd = [
-        CHROME, '--headless', '--disable-gpu', '--no-sandbox',
-        '--hide-scrollbars',
-        '--window-size=940,3000',  # 高度给足，渲染后裁剪
-        '--default-background-color=ffffffff',
-        f'--screenshot={png_file}',
-        f'file://{html_file}'
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    if not png_file.exists():
-        print(f'  [{i}] 渲染失败: {res.stderr[:200]}')
-        continue
-    # 自动裁剪底部白边
-    try:
-        from PIL import Image, ImageChops
-        img = Image.open(png_file).convert('RGB')
-        bg = Image.new('RGB', img.size, (255, 255, 255))
-        diff = ImageChops.difference(img, bg)
-        bbox = diff.getbbox()
-        if bbox:
-            l, t, rt, bt = bbox
-            bt = min(img.size[1], bt + 20)
-            img.crop((0, 0, img.size[0], bt)).save(png_file)
-    except ImportError:
-        # 兜底：用 sips 裁剪到尺寸（无法自动算白边，跳过）
-        pass
+    if is_screenshot_figure(item):
+        source = (Path(HTML_PATH).resolve().parent / item['data-prd-screenshot']).resolve()
+        shutil.copyfile(source, png_file)
+    else:
+        html_file = WORK / f'proto-{i}.html'
+        html_file.write_text(HTML_WRAPPER.format(content=str(item)), encoding='utf-8')
+        cmd = [
+            CHROME, '--headless', '--disable-gpu', '--no-sandbox',
+            '--hide-scrollbars', '--window-size=940,3000',
+            '--default-background-color=ffffffff',
+            f'--screenshot={png_file}', f'file://{html_file}'
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if not png_file.exists():
+            sys.exit(f'原型图 {i} 渲染失败: {res.stderr[:200]}')
+        try:
+            from PIL import Image, ImageChops
+            img = Image.open(png_file).convert('RGB')
+            bg = Image.new('RGB', img.size, (255, 255, 255))
+            bbox = ImageChops.difference(img, bg).getbbox()
+            if bbox:
+                img.crop((0, 0, img.size[0], min(img.size[1], bbox[3] + 20))).save(png_file)
+        except ImportError:
+            pass
     sz = subprocess.run(['sips', '-g', 'pixelWidth', '-g', 'pixelHeight', str(png_file)], capture_output=True, text=True).stdout
     w = int(re.search(r'pixelWidth:\s*(\d+)', sz).group(1))
     h = int(re.search(r'pixelHeight:\s*(\d+)', sz).group(1))
@@ -289,7 +387,13 @@ for i, div in enumerate(proto_divs, 1):
     png_paths.append(png_file)
     png_dims.append((w, h))
 
-print(f'渲染完成: {len(png_paths)}/{len(proto_divs)}')
+if len(png_paths) != len(proto_items):
+    sys.exit(f'原型图准备不完整: {len(png_paths)}/{len(proto_items)}')
+print(f'原型图准备完成: {len(png_paths)}/{len(proto_items)}')
+
+if args.prepare_only:
+    print(f'仅准备模式：{md_path}；未调用飞书或云效接口')
+    sys.exit(0)
 
 # ---------------- 4. 飞书 API：换 token ----------------
 print('\n[飞书] 换取 tenant_access_token ...')
@@ -325,14 +429,40 @@ else:
     DOC_ID = url_token
 DOC_URL = TARGET_URL
 
+# 原型只有一个共享附件，放在需求文档的直接父级版本文档中。
+# 在清空需求 PRD 前先校验父子关系并更新共享文件，失败时不触碰 PRD。
+SHARED_PARENT_URL = None
+if ATTACHMENT_PATH:
+    try:
+        iteration_parent = resolve_iteration_parent(
+            BASE, HEAD, TARGET_URL, args.prototype_parent_url)
+        shared_result = sync_shared_prototype(
+            BASE, HEAD, iteration_parent, ATTACHMENT_PATH, PROTOTYPE_SHA256)
+    except SharedPrototypeError as error:
+        sys.exit(f'共用原型更新失败，需求 PRD 尚未清空：{error}')
+    SHARED_PARENT_URL = shared_result['url']
+    print(f'  ✓ 版本文档共用原型已更新：{SHARED_PARENT_URL} '
+          f'(SHA-256 {shared_result["sha256"][:16]}...)')
+
 # ---------------- 5b. 清空文档现有 blocks ----------------
 print('\n[飞书] 清空目标文档现有 blocks ...')
-r = requests.get(f'{BASE}/docx/v1/documents/{DOC_ID}/blocks',
-                 headers=HEAD, params={'page_size': 500})
-resp = r.json()
-if resp.get('code') != 0:
-    print(f'  ✗ 列 blocks 失败: {resp}'); sys.exit(1)
-existing = resp['data']['items']
+existing, page_token = [], None
+while True:
+    params = {'page_size': 500}
+    if page_token:
+        params['page_token'] = page_token
+    r = requests.get(f'{BASE}/docx/v1/documents/{DOC_ID}/blocks',
+                     headers=HEAD, params=params)
+    resp = r.json()
+    if resp.get('code') != 0:
+        print(f'  ✗ 列 blocks 失败: {resp}'); sys.exit(1)
+    data = resp['data']
+    existing.extend(data.get('items', []))
+    if not data.get('has_more'):
+        break
+    page_token = data.get('page_token')
+    if not page_token:
+        print('  ✗ blocks 分页缺少 page_token，停止清空以避免残留'); sys.exit(1)
 # 根块（page block，block_type=1）保留；删除根块下所有 children
 root_block = next((b for b in existing if b['block_type'] == 1), None)
 if root_block is None:
@@ -458,7 +588,7 @@ print(f'\n[飞书] 按图片块上传 + 绑定 ({len(image_block_ids)} 个) ...'
 assert len(image_block_ids) == len(png_paths), f'图片块数 ({len(image_block_ids)}) 与 PNG 数 ({len(png_paths)}) 不匹配'
 
 ok = 0
-for i, (bid, p) in enumerate(zip(image_block_ids, png_paths), 1):
+for i, (bid, p, (pw, ph)) in enumerate(zip(image_block_ids, png_paths, png_dims), 1):
     # 上传图片素材：parent_node 用图片块 ID
     size = p.stat().st_size
     with open(p, 'rb') as f:
@@ -475,10 +605,10 @@ for i, (bid, p) in enumerate(zip(image_block_ids, png_paths), 1):
         print(f'  [{i}] ✗ 上传失败: {up}')
         continue
     ft = up['data']['file_token']
-    # 绑定 replace_image
+    # 绑定图片时一并写入真实尺寸；否则飞书可能把宽条图重置为 100x100。
     r = requests.patch(f'{BASE}/docx/v1/documents/{DOC_ID}/blocks/{bid}',
                        headers={**HEAD, 'Content-Type': 'application/json'},
-                       json={'replace_image': {'token': ft}})
+                       json={'replace_image': {'token': ft, 'width': pw, 'height': ph}})
     resp = r.json()
     if resp.get('code') == 0:
         ok += 1
@@ -488,6 +618,86 @@ for i, (bid, p) in enumerate(zip(image_block_ids, png_paths), 1):
     time.sleep(0.35)
 
 print(f'\n图片绑定完成: {ok}/{len(image_block_ids)}')
+if (PROTOTYPE_URL or ATTACHMENT_PATH) and ok != len(image_block_ids):
+    sys.exit('静态原型图未全部绑定，停止原型交付与云效联动')
+
+# ---------------- 10a. 在需求文档中链接父级版本文档的共用原型 ----------------
+shared_link_embedded = False
+if ATTACHMENT_PATH:
+    print('\n[飞书] 添加版本共用原型入口 ...')
+    intro_md = ('## 可交互原型\n\n'
+                f'[前往本迭代版本文档下载共用 HTML 原型]({SHARED_PARENT_URL})')
+    r = requests.post(f'{BASE}/docx/v1/documents/blocks/convert',
+                      headers={**HEAD, 'Content-Type': 'application/json'},
+                      json={'content_type': 'markdown', 'content': intro_md})
+    intro = r.json()
+    if intro.get('code') != 0:
+        sys.exit(f'共用原型入口转换失败，云效状态未更新: {intro}')
+    idata = intro['data']
+    r = requests.post(f'{BASE}/docx/v1/documents/{DOC_ID}/blocks/{DOC_ID}/descendant',
+                      headers={**HEAD, 'Content-Type': 'application/json'},
+                      json={'children_id': idata['first_level_block_ids'],
+                            'descendants': idata['blocks'], 'index': insert_idx})
+    created = r.json()
+    if created.get('code') != 0:
+        sys.exit(f'共用原型入口写入失败，云效状态未更新: {created}')
+    doc_blocks = list_blocks(BASE, HEAD, DOC_ID)
+    linked = any(
+        unquote(element.get('text_run', {}).get('text_element_style', {})
+                .get('link', {}).get('url', '')) == SHARED_PARENT_URL
+        for block in doc_blocks
+        for field in ('text', 'paragraph')
+        for element in block.get(field, {}).get('elements', [])
+    )
+    if not linked:
+        sys.exit('共用原型入口读回失败，云效状态未更新')
+    shared_link_embedded = True
+    print(f'  ✓ 已指向版本文档：{SHARED_PARENT_URL}')
+
+# ---------------- 10b. 插入可交互 HTML 的内嵌网页块 ----------------
+interactive_embedded = False
+if PROTOTYPE_URL:
+    print('\n[飞书] 插入可交互原型 iframe ...')
+    intro_md = f'## 可交互原型\n\n[在浏览器中打开同一原型]({PROTOTYPE_URL})'
+    r = requests.post(f'{BASE}/docx/v1/documents/blocks/convert',
+                      headers={**HEAD, 'Content-Type': 'application/json'},
+                      json={'content_type': 'markdown', 'content': intro_md})
+    converted = r.json()
+    if converted.get('code') != 0:
+        sys.exit(f'交互原型标题与链接转换失败: {converted}')
+    intro = converted['data']
+    r = requests.post(f'{BASE}/docx/v1/documents/{DOC_ID}/blocks/{DOC_ID}/descendant',
+                      headers={**HEAD, 'Content-Type': 'application/json'},
+                      json={'children_id': intro['first_level_block_ids'],
+                            'descendants': intro['blocks'], 'index': insert_idx})
+    result = r.json()
+    if result.get('code') != 0:
+        sys.exit(f'交互原型标题与链接插入失败: {result}')
+    time.sleep(0.35)
+
+    # 飞书 Docx Iframe Block 引用 URL；本地 HTML 字节已经在清空文档前与 URL 核对。
+    iframe_block = {'block_type': 26, 'iframe': {'component': {
+        'type': 99, 'url': quote(PROTOTYPE_URL, safe=''),
+    }}}
+    iframe_index = insert_idx + len(intro['first_level_block_ids'])
+    r = requests.post(f'{BASE}/docx/v1/documents/{DOC_ID}/blocks/{DOC_ID}/children',
+                      headers={**HEAD, 'Content-Type': 'application/json'},
+                      json={'children': [iframe_block], 'index': iframe_index})
+    created = r.json()
+    if created.get('code') != 0:
+        sys.exit(f'交互原型 iframe 插入失败，云效状态未更新: {created}')
+    children = created.get('data', {}).get('children', [])
+    iframe_id = children[0].get('block_id') if children else None
+    if not iframe_id:
+        sys.exit('iframe API 未返回 block_id，云效状态未更新')
+    r = requests.get(f'{BASE}/docx/v1/documents/{DOC_ID}/blocks/{iframe_id}', headers=HEAD)
+    checked = r.json()
+    block = checked.get('data', {}).get('block', {})
+    actual_url = unquote(block.get('iframe', {}).get('component', {}).get('url', ''))
+    if checked.get('code') != 0 or block.get('block_type') != 26 or actual_url != PROTOTYPE_URL:
+        sys.exit(f'iframe 写入后校验失败，云效状态未更新: {checked}')
+    interactive_embedded = True
+    print(f'  ✓ iframe 块 {iframe_id[:10]}... 已绑定原型 SHA-256 {PROTOTYPE_SHA256[:16]}...')
 
 # ---------------- 11. 向上回链：父节点 + 祖父节点 ----------------
 import urllib.parse as _up
@@ -624,50 +834,28 @@ elif parent_node:
 # ---------------- 12. 自动同步到云效需求描述 ----------------
 print('\n[云效] 同步飞书 URL 到对应需求描述 ...')
 
-def _find_aliyuncs_cfg(start_paths):
-    """从一组起点向上查找最近的 .aliyuncs.json"""
-    for start in start_paths:
-        if not start:
-            continue
-        p = Path(start).resolve()
-        if p.is_file():
-            p = p.parent
-        while True:
-            c = p / '.aliyuncs.json'
-            if c.exists():
-                return c
-            if p == p.parent:
-                break
-            p = p.parent
-    return None
+_aliyuncs_status_error = None
 
 # 找配置文件：先 HTML 所在路径向上，再 cwd 向上（HTML 可能在 /tmp，aliyuncs 在项目目录）
-_acfg_path = _find_aliyuncs_cfg([HTML_PATH, Path.cwd()])
+_acfg_path = find_aliyuncs_config([HTML_PATH, Path.cwd()])
 if not _acfg_path:
     print('  跳过：未找到 .aliyuncs.json（HTML 路径附近向上无云效配置）')
 else:
     _acfg = json.load(open(_acfg_path))
-    _reqs = _acfg.get('requirements', [])
-    # 按 feishu_url 精确匹配
-    _matched = next((r for r in _reqs if r.get('feishu_url') == TARGET_URL), None)
+    # 按 wiki/docx token 匹配，忽略 host、query 和尾斜杠差异。
+    _matched = match_requirement(_acfg, TARGET_URL)
     if not _matched:
-        print(f'  跳过：.aliyuncs.json 里没有 feishu_url == {TARGET_URL[-30:]} 的需求')
+        print(f'  跳过：.aliyuncs.json 里没有与 {TARGET_URL[-30:]} 对应的需求')
         print(f'         （如果是新工作流，aliyuncs:create-requirement 时应已写入 feishu_url）')
     else:
         _rid = _matched['identifier']
         try:
-            from alibabacloud_devops20210625.client import Client as _AyClient
-            from alibabacloud_tea_openapi.models import Config as _AyConfig
             from alibabacloud_devops20210625.models import UpdateWorkItemRequest as _UpdateReq
-        except ImportError:
-            print('  跳过：缺少 alibabacloud_devops20210625 SDK，运行 `pip3 install alibabacloud-devops20210625` 后重试')
+            _ayclient = build_client(_acfg)
+        except ImportError as _e:
+            print('  ✗ 缺少 alibabacloud_devops20210625 SDK，无法同步云效需求')
+            _aliyuncs_status_error = str(_e)
         else:
-            _aycfg = _AyConfig(
-                access_key_id=_acfg['accessKeyId'],
-                access_key_secret=_acfg['accessKeySecret'],
-                endpoint='devops.cn-hangzhou.aliyuncs.com',
-            )
-            _ayclient = _AyClient(_aycfg)
             try:
                 _info = _ayclient.get_work_item_info(_acfg['organizationId'], _rid)
                 _original = _info.body.workitem.document or ''
@@ -702,11 +890,30 @@ else:
                 else:
                     print(f'  - 云效需求 {_rid[:10]}... 顶部 PRD 链接已是最新，无需修改')
 
+            # 飞书发布完成后，需求进入设计阶段。状态按名称从该需求的实际工作流解析。
+            try:
+                _old_status, _status_changed = sync_requirement_status(
+                    _acfg_path, _acfg, _matched, '设计中', client=_ayclient)
+                if _status_changed:
+                    print(f'  ✓ 云效需求 {_rid[:10]}... 状态：{_old_status or "（未知）"} → 设计中')
+                else:
+                    print(f'  - 云效需求 {_rid[:10]}... 已是“设计中”，本地状态已同步')
+            except Exception as _e:
+                _aliyuncs_status_error = str(_e)
+                print(f'  ✗ 飞书 PRD 已发布，但云效需求状态更新失败: {_e}')
+
 # ---------------- 完成 ----------------
 print('\n=' * 30)
 print(f'✓ 飞书 PRD 已发布')
 print(f'  标题: {PRD_TITLE}')
 print(f'  链接: {DOC_URL}')
 print(f'  原型图: {ok}/{len(png_paths)} 张')
+if PROTOTYPE_URL:
+    print(f'  可交互原型: {"已内嵌" if interactive_embedded else "未内嵌"} {PROTOTYPE_URL}')
+if ATTACHMENT_PATH:
+    print(f'  版本共用原型: {"已链接" if shared_link_embedded else "未链接"} {SHARED_PARENT_URL}')
 print(f'  Block: {len(blocks)} 个')
 print('=' * 30)
+if _aliyuncs_status_error:
+    print(f'⚠ 云效联动未完成: {_aliyuncs_status_error}')
+    sys.exit(2)
